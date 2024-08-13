@@ -5,13 +5,32 @@ Some git defaults we set on our systems. Check comments in the file for more det
 # merges.sh
 
 Tells you all the branches that were merged to a specified branch.
-e.g. `merges.sh release` will tell you all the branches merged into release branch (from oldest merge to newest, duplicates removed).
+
+```sh
+merges.sh release
+```
+will tell you all the branches merged into release branch (from oldest merge to newest, duplicates removed).
 
 # rc.sh ("re-create" branch script)
 
 Script helps you create a fresh branch with only the features that you wanted to test/release.
 
-e.g. `rc.sh -t release branch1 branch2` will create a new release branch forked from latest master, with `branch1` and `branch2` merged into it. Script will attempt to rebase `branch1` and `branch2` to latest master before merge as well.
+```sh
+rc.sh -t release branch1 branch2
+```
+will create a new release branch forked from latest master, with `branch1` and `branch2` merged into it. Script will attempt to rebase `branch1` and `branch2` to latest master before merge as well.
+
+rc.sh can re-create a branch, by auto-detecting the branches merged into the target branch.
+
+```sh
+rc.sh -t release
+```
+
+You can add or remove branches from the auto-detected list of branches to be merged into the target branch.
+
+```sh
+rc.sh -t release --add branchX --remove branch5
+```
 
 Read rc.sh header comments to understand the different flags that can be used.
 
