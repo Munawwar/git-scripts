@@ -158,6 +158,7 @@ if [ ${#branches[@]} -eq 0 ] && ([ "$mode" == "add" ] || [ "$mode" == "remove" ]
   branches=($(
     git log --format="%s" --merges --reverse origin/master..origin/$targetBranch | \
     sed -E "s~Merge branch '([-\.a-zA-Z0-9]+)' into .+~\1~" | \
+    sed -E "s~Merge (remote-tracking )?branch '.+/([-\.a-zA-Z0-9]+)' into .+~\2~" | \
     sed -E "s~Merge pull request #[0-9]+ from Carriyo/(.+)~\1~" | \
     awk '!x[$0]++'
   ))
