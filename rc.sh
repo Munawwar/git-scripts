@@ -157,8 +157,8 @@ git fetch origin
 if [ ${#branches[@]} -eq 0 ] && ([ "$mode" == "add" ] || [ "$mode" == "remove" ]); then
   branches=($(
     git log --format="%s" --merges --reverse origin/master..origin/$targetBranch | \
-    sed -E "s~Merge branch '([-\.a-zA-Z0-9]+)' into .+~\1~" | \
-    sed -E "s~Merge (remote-tracking )?branch '.+/([-\.a-zA-Z0-9]+)' into .+~\2~" | \
+    sed -E "s~Merge branch '([^/]+)' into .+~\1~" | \
+    sed -E "s~Merge (remote-tracking )?branch '.+/(.+)' into .+~\2~" | \
     sed -E "s~Merge pull request #[0-9]+ from Carriyo/(.+)~\1~" | \
     awk '!x[$0]++'
   ))
@@ -325,34 +325,27 @@ if [[ $rebase -eq 1 ]]; then
   handle_rebase_failure() {
     local branch=$1
     while true; do
-      printf "${RED}Rebasing $branch to master failed. Choose an option:\n"
       if [ -z "$(git rerere remaining)" ]; then
-        printf "  a) Stage resolved changes and continue rebase\n"
+        printf $YELLOW"Auto-accepting past merge conflict resolution"$DEFCOLOR"\n"
+        conflicted_files=$(git diff --name-only --diff-filter=U)
+        #echo "Conflicted files: $conflicted_files"
+        git add $conflicted_files
+        # GIT_EDITOR=true skips asking for a commit message
+        GIT_EDITOR=true git rebase --continue
+        if [ $? -eq 0 ]; then
+          # successful rebase
+          return 0
+        else
+          continue  # This will repeat the loop
+        fi
       fi
+      printf "${RED}Rebasing $branch to master failed. Choose an option:\n"
       printf "  s) Skip this branch and continue with the rest\n"
       printf "  or press enter to abort\n"
       read -p "Enter your choice: " choice
       printf $DEFCOLOR
 
-      if [[ $choice =~ ^[Aa] ]]; then
-        if [ -z "$(git rerere remaining)" ]; then
-          echo "Staging changes and continuing rebase."
-          conflicted_files=$(git diff --name-only --diff-filter=U)
-          echo "Conflicted files: $conflicted_files"
-          git add $conflicted_files
-          # GIT_EDITOR=true skips asking for a commit message
-          GIT_EDITOR=true git rebase --continue
-          if [ $? -eq 0 ]; then
-            # successful rebase
-            return 0
-          else
-            continue  # This will repeat the loop
-          fi
-        else
-          git rebase --abort 1> /dev/null
-          exit 1
-        fi
-      elif [[ $choice =~ ^[Ss] ]]; then
+      if [[ $choice =~ ^[Ss] ]]; then
         git rebase --abort 1> /dev/null
         return 1
       else
@@ -399,13 +392,17 @@ for i in "${unmerged_branches[@]}"; do
   git merge --no-ff --no-edit $i 1> /dev/null
   merge_return_code=$?
   if [[ $merge_return_code != 0 ]]; then
-    remaining_conflicts=$(git rerere remaining | wc -l)
+    if [ -z "$(git rerere remaining)" ]; then
+      printf $YELLOW"Auto-accepting past merge conflict resolution"$DEFCOLOR"\n"
+      conflicted_files=$(git diff --name-only --diff-filter=U)
+      #echo "Conflicted files: $conflicted_files"
+      git add $conflicted_files
+      git commit -q -m "Merge branch '$i' into $targetBranch" --no-edit
+      continue
+    fi
 
     printf '\n'$RED'Merging failed!\n'
     printf 'Please choose one of the following options:\n'
-    if [[ $remaining_conflicts -eq 0 ]]; then
-      printf '  a) accept current merge conflict resolution\n'
-    fi
     printf '  c) resolve conflicts manually & commit first, and then use this option to continue script\n'
     printf '  s) skip this merge and continue with the next branch\n'
     printf '  or press enter to abort\n'
@@ -417,10 +414,6 @@ for i in "${unmerged_branches[@]}"; do
       printf $YELLOW'Skipping the merge for branch '$i' and continuing...\n'$DEFCOLOR'\n'
       git merge --abort 1> /dev/null
       continue
-    elif [[ $REPLY =~ ^[Aa] && $remaining_conflicts -eq 0 ]]; then
-      printf $YELLOW'Accepting current merge conflict resolution and committing changes...\n'$DEFCOLOR'\n'
-      git add . 1> /dev/null
-      git commit -q -m "Merge branch '$i' into $targetBranch" --no-edit
     else
       git merge --abort 1> /dev/null
       exit $merge_return_code;
