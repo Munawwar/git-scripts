@@ -13,7 +13,7 @@ will tell you all the branches merged into release branch (from oldest merge to 
 
 # rc.sh ("re-create" branch script)
 
-Script helps you create a fresh branch with only the branches that you wanted to test/release.
+Script helps you create a fresh branch with only the branches that you want to test/release.
 
 ```sh
 rc.sh -t release branch1 branch2
