@@ -14,7 +14,7 @@
 # You can add or remove branches to merge via --add/-a and --remove/-r flags:
 # rc.sh --target target-branch [--add branch-1 branch-2 ...] [--remove branch-1 branch-2 ...]
 #
-# If you dont want to auto-detection branches do not use --add,-a,--remove or -r,
+# If you don't want to auto-detection branches do not use --add,-a,--remove or -r,
 # and then only the branches you specify will be merged:
 # rc.sh --target target-branch branch-1 branch-2 ...
 #
@@ -37,6 +37,8 @@
 GREEN='\x1B[1;32m'
 YELLOW='\x1B[1;33m'
 RED='\x1B[1;31m'
+LIGHT_WHITE='\x1B[37m'
+BOLD_WHITE='\x1B[1;97m'
 DEFCOLOR='\x1B[0;m'
 
 # Check for unstaged or staged changes
@@ -46,6 +48,7 @@ if ! git diff-index --quiet HEAD --; then
   exit 1
 fi
 
+base=master
 rebase=1
 force=0
 rerere_train=1
@@ -54,6 +57,7 @@ rerere_from_branch=""
 mode="manual"
 additional_branches=()
 remove_branches=()
+auto_approve=0
 
 # Move command-line arguments into an array variable
 args=("$@")
@@ -81,6 +85,19 @@ do
   arg="${args[i]}"
 
   case ${args[i]} in
+    --base)
+      value=""
+      if [[ "$arg" == *=* ]]; then
+        # Split the flag from its value
+        value="${arg#*=}"  # Extract the part after the equal sign
+      elif [[ "${args[i+1]}" != -* ]]; then
+        value=("${args[i+1]}")
+        ((i++))
+      else
+        value="master"
+      fi
+      base=$value
+      ;;
     -t|--target)
       value=""
       if [[ "$arg" == *=* ]]; then
@@ -106,6 +123,9 @@ do
       ;;
     -n|--no-rebase)
       rebase=0
+      ;;
+    -y|--approve)
+      auto_approve=1
       ;;
     --no-rerere-train)
       rerere_train=0
@@ -156,7 +176,7 @@ git fetch origin
 # If no branches were specified auto-detect branches using logic from merges.sh
 if [ ${#branches[@]} -eq 0 ] && ([ "$mode" == "add" ] || [ "$mode" == "remove" ]); then
   branches=($(
-    git log --format="%s" --merges --reverse origin/master..origin/$targetBranch | \
+    git log --format="%s" --merges --reverse origin/$base..origin/$targetBranch | \
     sed -E "s~Merge branch '([^/]+)' into .+~\1~" | \
     sed -E "s~Merge (remote-tracking )?branch '.+/(.+)' into .+~\2~" | \
     sed -E "s~Merge pull request #[0-9]+ from Carriyo/(.+)~\1~" | \
@@ -186,28 +206,33 @@ if [[ -z $rerere_from_branch ]]; then
   rerere_from_branch=$targetBranch
 fi
 
-printf '\ntarget: '$targetBranch'\n'
-printf "rebase: $(if ((rebase)); then echo true; else echo false; fi)\n"
-printf "verify: $(if ((force)); then echo false; else echo true; fi)\n"
-printf "rerere train: $(if ((rerere_train)); then echo true; else echo false; fi)\n"
+printf "\n${BOLD_WHITE}target branch:${DEFCOLOR} ${GREEN}$targetBranch${DEFCOLOR}\n"
+printf "${BOLD_WHITE}base branch:${DEFCOLOR} ${GREEN}$base${DEFCOLOR}\n"
+printf "${BOLD_WHITE}rebase branches?${DEFCOLOR} $(if ((rebase)); then echo "yes"; else echo "no"; fi)\n"
+printf "${BOLD_WHITE}verify before push?${DEFCOLOR} $(if ((force)); then echo "no"; else echo "yes"; fi)\n"
+printf "${BOLD_WHITE}rerere train?${DEFCOLOR} $(if ((rerere_train)); then echo "yes"; else echo "no"; fi)\n"
 if [[ $rerere_train == 1 ]]; then
-  printf "rerere train overwrite: $(if ((rerere_overwrite)); then echo true; else echo false; fi)\n"
-  printf "rerere train from branch: ${rerere_from_branch:-$targetBranch}\n"
+  printf "${BOLD_WHITE}rerere train overwrite?${DEFCOLOR} $(if ((rerere_overwrite)); then echo "yes"; else echo "no"; fi)\n"
+  printf "${BOLD_WHITE}rerere train from branch: ${rerere_from_branch:-$targetBranch}${DEFCOLOR}\n"
 fi
-printf "\nbranches: ${branches[*]}\n\n"
+printf "\n${BOLD_WHITE}branches:${DEFCOLOR}\n"
+for branch in "${branches[@]}"; do
+    printf "${GREEN}${branch}${DEFCOLOR}\n"
+done
+printf "\n"
 
 # if two branches with same name but different cases are present, then it causes problems when checking out..
 # so delete local branch so that script works correctly
 #git branch | grep -Po '.*\w{1,}\-\d{1,}' | xargs git branch -D
 
-git checkout -q master
+git checkout -q $base
 if [ $? -ne 0 ]; then
-  printf $RED'Error: Failed to switch to master branch.'$DEFCOLOR'\n'
+  printf $RED'Error: Failed to switch to '$base' branch.'$DEFCOLOR'\n'
   exit 1
 fi
-git reset -q --hard origin/master
+git reset -q --hard origin/$base
 
-# Rerere train on commits between master and target branch
+# Rerere train on commits between $base and target branch
 # so that past merge conflict resolutions are reused
 if [[ $rerere_train == 1 ]]; then
   printf $RED
@@ -221,9 +246,9 @@ if [[ $rerere_train == 1 ]]; then
   train_rerere() {
     local rerere_from_branch=$1
 
-    printf $YELLOW"Rerere training on commits from master to $rerere_from_branch ..."$DEFCOLOR'\n'
+    printf $YELLOW"Rerere training on commits from "$base" to "$rerere_from_branch" ..."$DEFCOLOR"\n"
 
-    git rev-list --parents master..origin/$rerere_from_branch |
+    git rev-list --parents $base..origin/$rerere_from_branch |
     while read commit parent1 other_parents
     do
       if test -z "$other_parents"
@@ -264,12 +289,13 @@ if [[ $rerere_train == 1 ]]; then
     train_rerere "$targetBranch"
   fi
 
-  git checkout -q master
+  git checkout -q $base
   printf $YELLOW'Rerere training done'$DEFCOLOR'\n\n'
 fi
 
 # checkout all branches to sync with remote
 unmerged_branches=()
+merged_branches=()
 for i in "${branches[@]}"; do
   # .. sync with remote
   git checkout -q $i
@@ -279,48 +305,86 @@ for i in "${branches[@]}"; do
   fi
   git reset -q --hard origin/$i
 
-  # first check if branch was already merged to master or not
-  common_ancestor=$(git merge-base master $i)
+  # first check if branch was already merged to $base or not
+  common_ancestor=$(git merge-base $base $i)
   current_branch_commit_hash=$(git rev-parse $i)
   if [[ $common_ancestor == $current_branch_commit_hash ]]; then
-    printf $YELLOW''$i' was already merged to master'$DEFCOLOR'\n'
+    merged_branches+=("$i")
   else
     unmerged_branches+=("$i")
   fi
 done
 
+# Print already merged branches under one header
+if [ ${#merged_branches[@]} -gt 0 ]; then
+  printf "${YELLOW}Skipping branches already merged to ${base}:${DEFCOLOR}\n"
+  for branch in "${merged_branches[@]}"; do
+    printf "${BOLD_WHITE}${branch}${DEFCOLOR}\n"
+  done
+  printf "\n"
+fi
+
 if [[ $rebase -eq 1 ]]; then
-  # Function to check if a branch is on top of another branch
-  printf $YELLOW"Checking for stacked branches ..."$DEFCOLOR'\n'
+  printf $YELLOW"Analyzing branch dependencies ..."$DEFCOLOR"\n"
 
-  # If there are stacked branches, exclude duplicate branches for rebasing, by picking the top-most branches
-  is_on_top_of() {
-    git branch --contains $1 --format='%(refname:short)' | grep -qx $2
-  }
+  # Initialize arrays for branch dependencies and their distance from base
+  declare -A branch_deps          # Stores direct dependencies
+  declare -A branch_base_distance # Stores distance to base branch
 
-  base_branches=()
-  for ((i=0; i<${#unmerged_branches[@]}; i++)); do
-    for ((j=0; j<${#unmerged_branches[@]}; j++)); do
-      # printf "Checking branch ${unmerged_branches[i]} against ${unmerged_branches[j]}\n"
-      if [[ ${unmerged_branches[i]} != ${unmerged_branches[j]} ]]; then
-        if is_on_top_of ${unmerged_branches[j]} ${unmerged_branches[i]}; then
-          printf $YELLOW"Branch ${unmerged_branches[i]} is on top of branch ${unmerged_branches[j]}"$DEFCOLOR'\n'
-          base_branches+=(${unmerged_branches[j]})
-          break
+  # For each branch, find the closest dependency and its distance from base
+  for branch in "${unmerged_branches[@]}"; do
+    # Find distance to base
+    base_common_ancestor=$(git merge-base $base $branch)
+    base_distance=$(git rev-list --count $base_common_ancestor..$branch)
+    branch_base_distance[$branch]=$base_distance
+    
+    # Find direct dependency branch by picking the dependency branch that
+    # is the closest to it in number of commits
+    # e.g. if A -> B (2 commits) -> C (1 commit), then C is 3 commits away
+    # from A and 1 commit away from B, so C's direct dependency is B.
+    closest_dependency=""
+    min_distance=999999
+    
+    for other_branch in "${unmerged_branches[@]}"; do
+      if [[ "$branch" != "$other_branch" ]]; then
+        # Get common ancestor
+        merge_base=$(git merge-base $branch $other_branch)
+        
+        # If other_branch is an ancestor of branch
+        if [[ "$(git rev-parse $other_branch)" == "$(git rev-parse $merge_base)" ]]; then
+          # Check distance
+          distance=$(git rev-list --count $other_branch..$branch)
+          if [[ $distance -gt 0 && $distance -lt $min_distance ]]; then
+            closest_dependency=$other_branch
+            min_distance=$distance
+          fi
         fi
       fi
     done
+    
+    branch_deps[$branch]=$closest_dependency
   done
 
-  # Find the top-most branches (branches that are not in the base_branches array)
-  top_branches=()
-  for branch in "${unmerged_branches[@]}"; do
-    if [[ ! " ${base_branches[@]} " =~ " $branch " ]]; then
-      top_branches+=($branch)
+  # Sort branches by their distance from base
+  sorted_branches=($(
+    for branch in "${unmerged_branches[@]}"; do
+      echo "${branch_base_distance[$branch]} $branch"
+    done | sort -n | cut -d' ' -f2
+  ))
+
+  # Print branch dependencies
+  has_dependencies=0
+  for branch in "${sorted_branches[@]}"; do
+    depends_on="${branch_deps[$branch]:-$base}"
+    if [[ "$depends_on" != "$base" ]]; then
+      printf "${BOLD_WHITE}${branch}${DEFCOLOR} ${LIGHT_WHITE}depends on${DEFCOLOR} ${BOLD_WHITE}${depends_on}${DEFCOLOR}\n"
+      has_dependencies=1
     fi
   done
-
-  printf '\n'
+  if [[ $has_dependencies -eq 0 ]]; then
+    printf "No inter-branch dependencies found (all branches depend directly on ${base})\n"
+  fi
+  printf $YELLOW"Analyzing branch dependencies done"$DEFCOLOR'\n\n'
 
   handle_rebase_failure() {
     local branch=$1
@@ -339,7 +403,7 @@ if [[ $rebase -eq 1 ]]; then
           continue  # This will repeat the loop
         fi
       fi
-      printf "${RED}Rebasing $branch to master failed. Choose an option:\n"
+      printf "${RED}Rebasing ${GREEN}$branch${RED} to ${GREEN}$base${RED} failed. Choose an option:\n"
       printf "  s) Skip this branch and continue with the rest\n"
       printf "  or press enter to abort\n"
       read -p "Enter your choice: " choice
@@ -355,22 +419,22 @@ if [[ $rebase -eq 1 ]]; then
     done
   }
 
-  # rebase all top branches to master
-  for i in "${top_branches[@]}"; do
-    git checkout -q $i
-    printf $YELLOW'Rebasing '$i' to master'$DEFCOLOR'\n'
-    # .. and then rebase to master
-    git rebase --update-refs master 1> /dev/null
-    if [[ $? != 0 ]] && ! handle_rebase_failure $i; then
-      printf $RED"Removing $i from unmerged_branches due to rebase failure"$DEFCOLOR'\n'
+  # Rebase branches in order
+  for branch in "${sorted_branches[@]}"; do
+    depends_on="${branch_deps[$branch]:-$base}"
+    printf "${YELLOW}Rebasing ${BOLD_WHITE}${branch}${YELLOW} to ${depends_on} ..."$DEFCOLOR"\n"
+    git checkout -q $branch
+    git rebase --update-refs $depends_on 1> /dev/null
+
+    if [[ $? != 0 ]] && ! handle_rebase_failure $branch; then
+      printf $RED"Removing $branch from unmerged_branches due to rebase failure"$DEFCOLOR'\n'
       new_branches=()
-      for branch in "${unmerged_branches[@]}"; do
-        if [[ ! " ${i} " =~ " ${branch} " ]]; then
-          new_branches+=("$branch")
+      for b in "${unmerged_branches[@]}"; do
+        if [[ ! " ${branch} " =~ " ${b} " ]]; then
+          new_branches+=("$b")
         fi
       done
       unmerged_branches=("${new_branches[@]}")
-      echo "Unmerged branches: ${unmerged_branches[*]}"
     fi
     # sleep required to give git time to unlock rebase/merge locks
     sleep 2
@@ -384,11 +448,11 @@ if [ $? -ne 0 ]; then
   printf $RED'Error: Failed to switch to '$targetBranch' branch.'$DEFCOLOR'\n'
   exit 1
 fi
-git reset -q --hard origin/master
+git reset -q --hard origin/$base
 sleep 2
 
 for i in "${unmerged_branches[@]}"; do
-  printf $YELLOW"Merging $i to $targetBranch"$DEFCOLOR'\n'
+  printf $YELLOW"Merging ${BOLD_WHITE}${i}${YELLOW} to ${targetBranch} ..."$DEFCOLOR'\n'
   git merge --no-ff --no-edit $i 1> /dev/null
   merge_return_code=$?
   if [[ $merge_return_code != 0 ]]; then
@@ -422,21 +486,28 @@ for i in "${unmerged_branches[@]}"; do
   sleep 2
 done
 
-echo ''
-printf $GREEN'-----------\n'
-printf 'Change log\n'
-printf $GREEN'-----------\n'
-git log --format="%s (%an)" --no-merges master..$targetBranch | cat -
-printf $DEFCOLOR'\n'
+printf "\n"$BOLD_WHITE"-----------"$DEFCOLOR"\n"
+printf $BOLD_WHITE"Change log"$DEFCOLOR
+printf "\n"$BOLD_WHITE"-----------"$DEFCOLOR"\n"
+git log --format="- %s (%an)" --no-merges $base..$targetBranch | cat -
+printf "\n"
 
 printf $YELLOW
-read -p "Force push local branchs. Proceed? (y/n) " -r
-printf $DEFCOLOR
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-  if [[ $force == 1 ]]; then
-    git push --force-with-lease --no-verify origin "${unmerged_branches[@]}" "$targetBranch"
+if [[ $auto_approve == 0 ]]; then
+  read -p "Force push local branches. Proceed? (y/n) " -r
+  printf $DEFCOLOR
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    exit 0
   fi
-  if [[ $force == 0 ]]; then
-    git push --force-with-lease origin "${unmerged_branches[@]}" "$targetBranch"
-  fi
+else
+  printf 'Force pushing local branches'$DEFCOLOR'\n'
+fi
+
+# Fetch again just in case new changes were pushed by the time we reach here
+git fetch origin
+# Common push logic
+if [[ $force == 1 ]]; then
+  git push --force-with-lease --no-verify origin "${unmerged_branches[@]}" "$targetBranch"
+else
+  git push --force-with-lease origin "${unmerged_branches[@]}" "$targetBranch"
 fi
