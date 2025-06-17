@@ -13,7 +13,7 @@ will tell you all the branches merged into release branch (from oldest merge to 
 
 # rc.sh ("re-create" branch script)
 
-Script helps you create a fresh branch with only the features that you wanted to test/release.
+Script helps you create a fresh branch with only the branches that you wanted to test/release.
 
 ```sh
 rc.sh -t release branch1 branch2
@@ -40,16 +40,19 @@ Read rc.sh header comments to understand the different flags that can be used.
 
 ## What does rc.sh script do?
 
-step 0 - "learns" about past merge conflict resolutions done on existing target branch (develop or release), so that merging branches on step number 3 is easier. To understand more about it read about [git rerere ("reuse recorded resolution")](https://git-scm.com/book/en/v2/Git-Tools-Rerere) and [rerere-train.sh](https://github.com/git/git/blob/master/contrib/rerere-train.sh).
+Step 1 - Resets target branch to base branch (base branch is `master` by default)
 
-step 1 - resets target branch to master
+Step 2 - "Learns" about past merge conflict resolutions done on existing target branch (develop or release), so that merging branches on step number 4 is easier. To understand more about it read about [git rerere ("reuse recorded resolution")](https://git-scm.com/book/en/v2/Git-Tools-Rerere) and [rerere-train.sh](https://github.com/git/git/blob/master/contrib/rerere-train.sh).
 
-step 2 - rebases all features branches with latest master
-(rebasing long running branch is problematic. I suggest these be excluded and merged separately)
+Tip: Enable git rerere (`git config rerere.enabled true`) so that you dont have to redo previously resolved merge conflicts if you need to re-create the branch again.
 
-step 3 - merges each feature branch one-by-one to target branch. If it hits a merge a conflict, it waits till you manually intervene & fix the merge OR allows you to skip the merge & continue OR allows you to abort the script entirely.
+Step 3 - Rebases all branches with latest master. It tries to detect stacked branches and rebase in-order. If there is an issue rebasing you get option to skip the branch from being rebased and merged.
 
-step 4 - prompts to force push target branch and the rebased feature branches (uses `--force-with-lease` flag)
+Tip: Rebasing long running branches are problematic. [I suggest to exclude them and merge them separately](#solution-for-long-running-branches).
+
+Step 4 - Merges each branch one-by-one to target branch. If it hits a merge a conflict, it checks if there was a past merge conflict resolution. If it does have one then uses that and proceeds. Else it waits till you manually intervene & fix the merge OR allows you to skip the merge & continue OR allows you to abort the script entirely.
+
+Step 5 - If auto-approval flag wasn't used, then prompts to force push target branch and the rebased branches (uses `--force-with-lease` flag)
 
 ## Solution for long running branches
 
@@ -58,9 +61,6 @@ long running branch means e.g a branch that touches 100s of files that is taking
 1. merge master to long running branch
 2. deploy all other branches first. i.e. dont add the long running branches as part of rc.sh command
 3. merge long running branches to target branch after rc push
-
-Tip: Enable git rerere (`git config rerere.enabled true`) so that you dont have to redo previously resolved merge conflicts if you need to re-create the branch again.
-Use [rerere-train.sh](https://github.com/git/git/blob/master/contrib/rerere-train.sh) to train rerere with old resolutions done by other team members. To find which commit from which to train rerere use `branch-point.sh` (example usage `branch-point.sh dev` will give the commit from which `dev` branch was branched out from, relative to master branch)
 
 # close-release.sh
 
