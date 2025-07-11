@@ -453,8 +453,14 @@ sleep 2
 
 for i in "${unmerged_branches[@]}"; do
   printf $YELLOW"Merging ${BOLD_WHITE}${i}${YELLOW} to ${targetBranch} ..."$DEFCOLOR'\n'
-  git merge --no-ff --no-edit $i 1> /dev/null
+  merge_output=$(git merge --no-ff --no-edit $i 2>&1)
   merge_return_code=$?
+  
+  # Check if branch was already merged
+  if [[ $merge_output == *"Already up to date."* ]]; then
+    printf $YELLOW"${BOLD_WHITE}Branch ${i} was already merged to ${base} in the past"$DEFCOLOR'\n'
+    continue
+  fi
   if [[ $merge_return_code != 0 ]]; then
     if [ -z "$(git rerere remaining)" ]; then
       printf $YELLOW"Auto-accepting past merge conflict resolution"$DEFCOLOR"\n"
