@@ -11,6 +11,15 @@ list-merges.sh release
 ```
 will tell you all the branches merged into release branch (from oldest merge to newest, duplicates removed).
 
+# merge.sh
+
+Syncs list of local branches with remote and merges the branches to a target branch
+It does not rebase the branches, it just merges them.
+
+```sh
+merges.sh release branch1 branch2
+```
+
 # rc.sh ("re-create" branch script)
 
 Script helps you create a fresh branch with only the branches that you want to test/release.
