@@ -2,12 +2,12 @@
 
 Some git defaults we set on our systems. Check comments in the file for more details.
 
-# merges.sh
+# list-merges.sh
 
 Tells you all the branches that were merged to a specified branch.
 
 ```sh
-merges.sh release
+list-merges.sh release
 ```
 will tell you all the branches merged into release branch (from oldest merge to newest, duplicates removed).
 
