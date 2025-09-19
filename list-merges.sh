@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Prints merge branches between master and given branch
-# Usage: merges.sh develop
+# Usage: list-merges.sh develop
 #
 # remember to do:
-# chmod +x merges.sh
+# chmod +x list-merges.sh
 #
 # Prints from oldest merge to latest
 # Tries to find branch names from git and github PR's auto commit message pattern
