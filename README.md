@@ -13,9 +13,10 @@ will tell you all the branches merged into release branch (from oldest merge to 
 
 # merge.sh
 
-Syncs list of local branches with remote and merges the branches to a target branch. It does not rebase the branches, it just merges them.
+Syncs list of local branches with remote and merges the branches to a target branch. It does not rebase the branches, it just merges them. e.g.
 
 ```sh
+# merge `branch1` and `branch2` into `release` branch
 merges.sh release branch1 branch2
 ```
 
