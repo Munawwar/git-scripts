@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# Syncs list of local branches with remote and merges the branches to a target branch
 # Usage: ./merge.sh <target_branch> <source_branch1> [source_branch2] [source_branch3] ...
 # Example: ./merge.sh release branch1 branch2
 
