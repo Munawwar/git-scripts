@@ -1,8 +1,12 @@
 #!/bin/bash
 
 # Syncs list of local branches with remote and merges the branches to a target branch
-# Usage: ./merge.sh <target_branch> <source_branch1> [source_branch2] [source_branch3] ...
+# It does not rebase the branches, it just merges them.
+#
+# Usage: ./merge.sh [-f] [-n] <target_branch> <source_branch1> [source_branch2] [source_branch3] ...
 # Example: ./merge.sh release branch1 branch2
+#   -f  Push with --no-verify (skip pre-push hooks)
+#   -n  Skip resetting branches to origin (use local state as-is)
 
 set -e
 
@@ -13,9 +17,23 @@ LIGHT_WHITE='\x1B[37m'
 BOLD_WHITE='\x1B[1;97m'
 DEFCOLOR='\x1B[0;m'
 
+NO_VERIFY=false
+NO_REBASE=false
+
+while getopts "fn" opt; do
+    case $opt in
+        f) NO_VERIFY=true ;;
+        n) NO_REBASE=true ;;
+        *) ;;
+    esac
+done
+shift $((OPTIND - 1))
+
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <target_branch> <source_branch1> [source_branch2] [source_branch3] ..."
+    echo "Usage: $0 [-f] [-n] <target_branch> <source_branch1> [source_branch2] [source_branch3] ..."
     echo "Example: $0 release branch1 branch2"
+    echo "  -f  Push with --no-verify (skip pre-push hooks)"
+    echo "  -n  Skip resetting branches to origin (use local state as-is)"
     exit 1
 fi
 
@@ -26,7 +44,9 @@ SOURCE_BRANCHES=("$@")
 git fetch --all -q
 
 git checkout "$TARGET_BRANCH" -q
-git reset --hard "origin/$TARGET_BRANCH" -q
+if [[ "$NO_REBASE" == false ]]; then
+    git reset --hard "origin/$TARGET_BRANCH" -q
+fi
 
 # Store the original commit SHA of the target branch
 ORIGINAL_SHA=$(git rev-parse "origin/$TARGET_BRANCH")
@@ -34,7 +54,9 @@ ORIGINAL_SHA=$(git rev-parse "origin/$TARGET_BRANCH")
 for BRANCH in "${SOURCE_BRANCHES[@]}"; do
     printf $YELLOW"Merging ${BOLD_WHITE}${BRANCH}${YELLOW} to ${BOLD_WHITE}${TARGET_BRANCH}${DEFCOLOR}\n"
     git checkout "$BRANCH" -q
-    git reset --hard "origin/$BRANCH" -q
+    if [[ "$NO_REBASE" == false ]]; then
+        git reset --hard "origin/$BRANCH" -q
+    fi
     git checkout "$TARGET_BRANCH" -q
     
     merge_output=$(git merge "$BRANCH" --no-edit 2>&1)
@@ -81,5 +103,9 @@ if [[ "$ORIGINAL_SHA" == "$CURRENT_SHA" ]]; then
     printf $YELLOW"No changes made to ${BOLD_WHITE}${TARGET_BRANCH}\n${YELLOW}\n"
 else
     printf $GREEN"Pushing to origin/${TARGET_BRANCH}...${DEFCOLOR}\n"
-    git push origin "$TARGET_BRANCH"
+    if [[ "$NO_VERIFY" == true ]]; then
+        git push origin "$TARGET_BRANCH" --no-verify
+    else
+        git push origin "$TARGET_BRANCH"
+    fi
 fi
