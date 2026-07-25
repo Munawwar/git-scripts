@@ -1,0 +1,1113 @@
+import "std/string.zc"
+
+include <stdio.h>
+include <stdlib.h>
+include <string.h>
+
+extern struct FILE;
+extern fn popen(command: const char*, mode: const char*) -> FILE*;
+extern fn pclose(stream: FILE*) -> int;
+
+let ZERO_OID: const string = "0000000000000000000000000000000000000000";
+
+/// One active remote branch plus its inferred historical stack relationship.
+struct Branch {
+    name: String;
+    history_sha: String;
+    remote_sha: String;
+    future_sha: String;
+    local_sha: String;
+    parent: int;
+    depth: int;
+    pushed: bool;
+    deleted: bool;
+    stale: bool;
+    needs_sync: bool;
+}
+
+/// One destination branch and object ID proposed by Git or stack-push.
+struct Update {
+    local_sha: String;
+    remote_name: String;
+    fetched_remote_sha: String;
+    sync_base_sha: String;
+    needs_sync: bool;
+}
+
+/// One remote-tracking branch tip captured before or after fetching.
+struct RemoteTip {
+    name: String;
+    sha: String;
+}
+
+/// Returns one POSIX-shell argument with all embedded single quotes escaped.
+/// Git permits shell metacharacters in ref names, so every dynamic value passed
+/// through `system` or `popen` must go through this function.
+fn shell_arg(value: char*) -> String {
+    let quoted = String::from("'");
+    let i: usize = 0;
+    while (value[i] != 0) {
+        if (value[i] == '\'') {
+            quoted.append_c("'\"'\"'");
+        } else {
+            let character: char[2];
+            character[0] = value[i];
+            character[1] = 0;
+            quoted.append_c((char*)character);
+        }
+        i = i + 1;
+    }
+    quoted.append_c("'");
+    return quoted;
+}
+
+/// Runs a shell command, captures stdout, and reports whether it exited zero.
+/// Callers explicitly add `2>/dev/null` or `2>&1` when they want to redirect
+/// stderr; keeping that choice at each call site prevents hidden diagnostics.
+fn command_output(command: char*, ok: bool*) -> String {
+    let stream = popen(command, "r");
+    let output = String::from("");
+    if (stream == NULL) {
+        *ok = false;
+        return output;
+    }
+
+    let buffer: char[1024];
+    while (fgets((char*)buffer, 1024, stream) != NULL) {
+        output.append_c((char*)buffer);
+    }
+    *ok = pclose(stream) == 0;
+    return output;
+}
+
+/// Runs a shell command without capturing its output and returns true on
+/// success. Interactive Git operations use this so Git retains the terminal.
+fn command_status(command: char*) -> bool {
+    let status = system(command);
+    return status == 0;
+}
+
+/// Returns whether one commit is reachable from another. The uncommon
+/// `merge-base --is-ancestor A B` command exits zero exactly when A is part of
+/// B's history, without producing or parsing human-readable output.
+fn is_ancestor(ancestor: char*, descendant: char*) -> bool {
+    let command = String::from("git merge-base --is-ancestor ");
+    command.append_c(ancestor);
+    command.append_c(" ");
+    command.append_c(descendant);
+    command.append_c(" 2>/dev/null");
+    return command_status(command.c_str());
+}
+
+/// Finds a branch by its remote name or returns -1 when it is not in the active
+/// graph. This is shared by update application and explicit lease generation.
+fn branch_index(branches: Vec<Branch>*, name: char*) -> int {
+    let i: usize = 0;
+    while (i < branches.len) {
+        if (strcmp(branches.data[i].name.c_str(), name) == 0) return (int)i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Finds a captured remote tip by branch name or returns -1 when absent.
+fn tip_index(tips: Vec<RemoteTip>*, name: char*) -> int {
+    let i: usize = 0;
+    while (i < tips.len) {
+        if (strcmp(tips.data[i].name.c_str(), name) == 0) return (int)i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Returns whether a branch name appears as one whole whitespace-separated
+/// item. This avoids substring matches such as `test` matching `test-next`.
+fn name_in_list(name: char*, list: char*) -> bool {
+    let name_length = strlen(name);
+    let cursor: char* = list;
+    while (*cursor != 0) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') cursor = cursor + 1;
+        let end: char* = cursor;
+        while (*end != 0 && *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') end = end + 1;
+        if ((usize)(end - cursor) == name_length && strncmp(cursor, name, name_length) == 0) return true;
+        cursor = end;
+    }
+    return false;
+}
+
+/// Appends one explicit force-with-lease option to a pending push command.
+@cfg(stack_push)
+fn append_lease(command: String*, name: char*, expected_sha: char*) {
+    let lease = String::from("--force-with-lease=refs/heads/");
+    lease.append_c(name);
+    lease.append_c(":");
+    lease.append_c(expected_sha);
+    command.append_c(shell_arg(lease.c_str()).c_str());
+    command.append_c(" ");
+}
+
+/// Appends a same-name local-to-remote branch refspec to a push command.
+@cfg(stack_push)
+fn append_refspec(command: String*, name: char*) {
+    let refspec = String::from(name);
+    refspec.append_c(":refs/heads/");
+    refspec.append_c(name);
+    command.append_c(" ");
+    command.append_c(shell_arg(refspec.c_str()).c_str());
+}
+
+/// Removes trailing CR/LF characters from captured command output in place.
+fn trim_eol(value: String*) {
+    while (value.length() > 0) {
+        let last = value.length() - 1;
+        if (value.c_str()[last] != '\n' && value.c_str()[last] != '\r') break;
+        value.c_str()[last] = 0;
+        value.vec.len = value.vec.len - 1;
+    }
+}
+
+/// Prints a consistent error and returns the nonzero process status.
+fn fail(message: char*) -> int {
+    fprintf(stderr, "Error: %s\n", message);
+    return 1;
+}
+
+/// Replays a branch's commits after OLD onto NEW, then returns its new tip in
+/// `tip`. On conflict, only this failed rebase is aborted before checkout is
+/// restored; earlier successful branch updates remain intact.
+@cfg(stack_push)
+fn replay_commits(name: char*, new_base: char*, old_base: char*, restore: char*, tip: String*) -> int {
+    let command = String::from("git rebase --onto ");
+    command.append_c(new_base);
+    command.append_c(" ");
+    command.append_c(old_base);
+    command.append_c(" ");
+    command.append_c(shell_arg(name).c_str());
+    if (!command_status(command.c_str())) {
+        // `rebase --abort` restores this failed branch's old tip. Checkout
+        // restoration is attempted independently so both failures are clear.
+        let abort_ok = command_status("git rebase --abort >/dev/null 2>&1");
+        command = String::from("git checkout --quiet ");
+        command.append_c(shell_arg(restore).c_str());
+        let restore_ok = command_status(command.c_str());
+        if (!abort_ok && !restore_ok) {
+            return fail("rebase failed; neither its automatic abort nor the original checkout restoration succeeded.");
+        }
+        if (!abort_ok) {
+            return fail("rebase failed; its automatic abort failed, but the original checkout was restored.");
+        }
+        if (!restore_ok) {
+            return fail("rebase was aborted, but the original checkout could not be restored.");
+        }
+        return fail("rebase failed; it was aborted and the original checkout was restored.");
+    }
+
+    let branch_ref = String::from("refs/heads/");
+    branch_ref.append_c(name);
+    command = String::from("git rev-parse ");
+    command.append_c(shell_arg(branch_ref.c_str()).c_str());
+    let ok = false;
+    *tip = command_output(command.c_str(), &ok);
+    if (!ok) return fail("could not resolve a branch after rebasing it.");
+    trim_eol(tip);
+    return 0;
+}
+
+/// Captures every currently known remote-tracking branch and object ID. Taking
+/// this snapshot before fetch preserves both the command-start lease boundary
+/// and stack relationships that a concurrent remote update might break.
+fn load_remote_tips(remote: char*, ok: bool*) -> Vec<RemoteTip> {
+    let prefix = String::from("refs/remotes/");
+    prefix.append_c(remote);
+    let command = String::from("git for-each-ref '--format=%(refname:strip=3) %(objectname)' ");
+    command.append_c(shell_arg(prefix.c_str()).c_str());
+    command.append_c(" 2>/dev/null");
+    let listing = command_output(command.c_str(), ok);
+    let tips = Vec<RemoteTip>::new();
+    if (!*ok) return tips;
+
+    let copy = String::from(listing.c_str());
+    let row = strtok(copy.c_str(), "\r\n");
+    while (row != NULL) {
+        let separator = strchr(row, ' ');
+        if (separator != NULL) {
+            *separator = 0;
+            if (strcmp(row, "HEAD") != 0) {
+                tips.push(RemoteTip {
+                    name: String::from(row),
+                    sha: String::from(separator + 1)
+                });
+            }
+        }
+        row = strtok(NULL, "\r\n");
+    }
+    return tips;
+}
+
+/// Infers one direct parent for every active branch. The configured base wins
+/// equal-distance ties. Other branch names at the same commit are equivalent;
+/// a branch participating in this push wins that tie. Divergent equally-near
+/// parents are rejected because one linear rebase cannot preserve both.
+fn infer_parents(branches: Vec<Branch>*, base_sha: char*) -> bool {
+    let ok = false;
+    let i: usize = 0;
+    while (i < branches.len) {
+        let best_distance = 2147483647;
+        if (is_ancestor(base_sha, branches.data[i].history_sha.c_str())) {
+            let base_command = String::from("git rev-list --ancestry-path --count ");
+            base_command.append_c(base_sha);
+            base_command.append_c("..");
+            base_command.append_c(branches.data[i].history_sha.c_str());
+            base_command.append_c(" 2>/dev/null");
+            let base_distance = command_output(base_command.c_str(), &ok);
+            if (!ok) {
+                fprintf(stderr, "Error: could not measure ancestry from the configured base.\n");
+                return false;
+            }
+            best_distance = atoi(base_distance.c_str());
+        }
+
+        let j: usize = 0;
+        while (j < branches.len) {
+            if (i != j && is_ancestor(branches.data[j].history_sha.c_str(), branches.data[i].history_sha.c_str())) {
+                let command = String::from("git rev-list --ancestry-path --count ");
+                command.append_c(branches.data[j].history_sha.c_str());
+                command.append_c("..");
+                command.append_c(branches.data[i].history_sha.c_str());
+                command.append_c(" 2>/dev/null");
+                let distance_text = command_output(command.c_str(), &ok);
+                if (!ok) {
+                    fprintf(stderr, "Error: could not measure ancestry between stack branches.\n");
+                    return false;
+                }
+                let distance = atoi(distance_text.c_str());
+                if (distance > 0 && distance < best_distance) {
+                    branches.data[i].parent = (int)j;
+                    best_distance = distance;
+                } else if (distance > 0 && distance == best_distance && branches.data[i].parent >= 0) {
+                    let current = branches.data[i].parent;
+                    let same_tip = strcmp(branches.data[current].history_sha.c_str(), branches.data[j].history_sha.c_str()) == 0;
+                    if (!same_tip) {
+                        fprintf(stderr, "Error: %s has equally near parents %s and %s on different commits.\n",
+                            branches.data[i].name.c_str(), branches.data[current].name.c_str(), branches.data[j].name.c_str());
+                        return false;
+                    }
+                    if (branches.data[j].pushed && !branches.data[current].pushed) {
+                        branches.data[i].parent = (int)j;
+                    } else if (branches.data[j].pushed && branches.data[current].pushed &&
+                        strcmp(branches.data[j].future_sha.c_str(), branches.data[current].future_sha.c_str()) != 0) {
+                        fprintf(stderr, "Error: equivalent parents %s and %s would diverge in this push; %s cannot be stacked on both.\n",
+                            branches.data[current].name.c_str(), branches.data[j].name.c_str(), branches.data[i].name.c_str());
+                        return false;
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Marks every surviving branch whose historical parent will no longer be an
+/// ancestor after the proposed push. Drift then propagates by depth because a
+/// repaired parent changes the base on which all of its descendants depend.
+fn mark_stale_branches(branches: Vec<Branch>*) -> int {
+    let max_depth = 0;
+    let i: usize = 0;
+    while (i < branches.len) {
+        let cursor = branches.data[i].parent;
+        while (cursor >= 0) {
+            branches.data[i].depth = branches.data[i].depth + 1;
+            cursor = branches.data[cursor].parent;
+        }
+        if (branches.data[i].depth > max_depth) max_depth = branches.data[i].depth;
+        if (!branches.data[i].deleted && branches.data[i].parent >= 0) {
+            let parent = branches.data[i].parent;
+            branches.data[i].stale = branches.data[parent].deleted ||
+                !is_ancestor(branches.data[parent].future_sha.c_str(), branches.data[i].future_sha.c_str());
+            let parent_rewritten = !is_ancestor(branches.data[parent].history_sha.c_str(), branches.data[parent].future_sha.c_str());
+            if (!branches.data[i].stale && parent_rewritten &&
+                is_ancestor(branches.data[parent].history_sha.c_str(), branches.data[i].future_sha.c_str())) {
+                branches.data[i].stale = true;
+            }
+        }
+        i = i + 1;
+    }
+
+    let depth = 1;
+    while (depth <= max_depth) {
+        i = 0;
+        while (i < branches.len) {
+            let parent = branches.data[i].parent;
+            if (!branches.data[i].deleted && branches.data[i].depth == depth &&
+                parent >= 0 && branches.data[parent].stale) {
+                branches.data[i].stale = true;
+            }
+            i = i + 1;
+        }
+        depth = depth + 1;
+    }
+    return max_depth;
+}
+
+/// Checks the exact ref updates supplied to a Git pre-push hook. This workflow
+/// can fetch remote-tracking refs but contains no command that changes local
+/// branches or pushes remote refs.
+fn run_stack_check(argc: int, argv: string*) -> int {
+    // --- Parse hook configuration and proposed ref updates. ---
+    if (getenv("STACK_CHECK_SKIP") != NULL) return 0;
+
+    let remote: string = "origin";
+    let remote_explicit = false;
+    let do_fetch = true;
+    let base: char* = "master";
+    let releases: char* = "dev test release master main";
+    let targets = Vec<String>::new();
+    let arg_index = 1;
+    while (arg_index < argc) {
+        if (strcmp(argv[arg_index], "--no-fetch") == 0) {
+            do_fetch = false;
+        } else if (strncmp(argv[arg_index], "--remote=", 9) == 0) {
+            remote = argv[arg_index] + 9;
+            remote_explicit = true;
+        } else if (strncmp(argv[arg_index], "--base=", 7) == 0) {
+            base = argv[arg_index] + 7;
+        } else if (strncmp(argv[arg_index], "--release-branches=", 19) == 0) {
+            releases = argv[arg_index] + 19;
+        } else if (strcmp(argv[arg_index], "-h") == 0 || strcmp(argv[arg_index], "--help") == 0) {
+            fprintf(stdout, "Usage: stack-check [remote] [remote-url]\n");
+            fprintf(stdout, "Git pre-push hook; reads ref updates from stdin.\n");
+            return 0;
+        } else if (argv[arg_index][0] == '-') {
+            return fail("unknown option; use --help for usage.");
+        } else {
+            targets.push(String::from(argv[arg_index]));
+        }
+        arg_index = arg_index + 1;
+    }
+    if (targets.len > 0 && !remote_explicit) remote = targets.data[0].c_str();
+
+    let updates = Vec<Update>::new();
+    let line: char[4096];
+    while (fgets((char*)line, 4096, stdin) != NULL) {
+        // Git provides: <local-ref> <local-sha> <remote-ref> <remote-sha>.
+        // Only destination branches can participate in a branch stack.
+        strtok((char*)line, " \t\r\n");
+        let local_sha: char* = strtok(NULL, " \t\r\n");
+        let remote_ref: char* = strtok(NULL, " \t\r\n");
+        strtok(NULL, " \t\r\n");
+        if (local_sha == NULL || remote_ref == NULL) continue;
+        if (strncmp(remote_ref, "refs/heads/", 11) != 0) continue;
+        updates.push(Update {
+            local_sha: String::from(local_sha),
+            remote_name: String::from(remote_ref + 11),
+            fetched_remote_sha: String::from(""),
+            sync_base_sha: String::from(""),
+            needs_sync: false
+        });
+    }
+    if (updates.len == 0) return 0;
+
+    // --- Fetch complete remote branch history. ---
+    let ok = false;
+    let q_remote = shell_arg(remote);
+    let command = String::from("git remote get-url ");
+    command.append_c(q_remote.c_str());
+    command.append_c(" >/dev/null 2>&1");
+    if (!command_status(command.c_str())) return fail("the push remote must be a configured Git remote.");
+
+    let starting_tips = load_remote_tips(remote, &ok);
+    if (!ok) return fail("could not snapshot remote-tracking branches before fetch.");
+
+    if (do_fetch) {
+        let shallow = command_output("git rev-parse --is-shallow-repository 2>/dev/null", &ok);
+        let fetch_refspec = String::from("+refs/heads/*:refs/remotes/");
+        fetch_refspec.append_c(remote);
+        fetch_refspec.append_c("/*");
+        command = String::from("git fetch --quiet --prune ");
+        if (ok && strncmp(shallow.c_str(), "true", 4) == 0) command.append_c("--unshallow ");
+        command.append_c(q_remote.c_str());
+        command.append_c(" ");
+        command.append_c(shell_arg(fetch_refspec.c_str()).c_str());
+        if (!command_status(command.c_str())) return fail("failed to fetch complete history from the push remote.");
+    }
+
+    // --- Resolve the historical base and enumerate every active branch. ---
+    let base_ref = String::from("refs/remotes/");
+    base_ref.append_c(remote);
+    base_ref.append_c("/");
+    base_ref.append_c(base);
+    command = String::from("git rev-parse --verify ");
+    command.append_c(shell_arg(base_ref.c_str()).c_str());
+    command.append_c(" 2>/dev/null");
+    let base_sha = command_output(command.c_str(), &ok);
+    if (!ok) return fail("the configured base branch has no remote-tracking ref.");
+    trim_eol(&base_sha);
+    let history_base_sha = String::from(base_sha.c_str());
+    let starting_base_index = tip_index(&starting_tips, base);
+    if (starting_base_index >= 0) {
+        history_base_sha = String::from(starting_tips.data[starting_base_index].sha.c_str());
+    }
+
+    // `--no-merged=<base>` omits completed branches while retaining open
+    // branches regardless of the age or size of their history.
+    command = String::from("git for-each-ref '--format=%(refname:strip=3) %(objectname)' --no-merged=");
+    command.append_c(base_sha.c_str());
+    command.append_c(" ");
+    let remote_prefix = String::from("refs/remotes/");
+    remote_prefix.append_c(remote);
+    command.append_c(shell_arg(remote_prefix.c_str()).c_str());
+    command.append_c(" 2>/dev/null");
+    let listing = command_output(command.c_str(), &ok);
+    if (!ok) return fail("could not enumerate remote branches.");
+
+    let branches = Vec<Branch>::new();
+    let listing_copy = String::from(listing.c_str());
+    let row = strtok(listing_copy.c_str(), "\r\n");
+    while (row != NULL) {
+        let separator = strchr(row, ' ');
+        if (separator != NULL) {
+            *separator = 0;
+            let sha: char* = separator + 1;
+            let excluded = strcmp(row, "HEAD") == 0 || name_in_list(row, releases);
+            if (!excluded) {
+                let history_sha = String::from(sha);
+                let starting_index = tip_index(&starting_tips, row);
+                if (starting_index >= 0) {
+                    history_sha = String::from(starting_tips.data[starting_index].sha.c_str());
+                }
+                branches.push(Branch {
+                    name: String::from(row),
+                    history_sha: String::from(history_sha.c_str()),
+                    remote_sha: String::from(sha),
+                    future_sha: String::from(sha),
+                    local_sha: String::from(""),
+                    parent: -1,
+                    depth: 0,
+                    pushed: false,
+                    deleted: false,
+                    stale: false,
+                    needs_sync: false
+                });
+            }
+        }
+        row = strtok(NULL, "\r\n");
+    }
+
+    // --- Apply proposed tips, infer parents, and detect broken edges. ---
+    let i: usize = 0;
+    while (i < updates.len) {
+        let index = branch_index(&branches, updates.data[i].remote_name.c_str());
+        if (index >= 0) {
+            branches.data[index].pushed = true;
+            branches.data[index].deleted = strcmp(updates.data[i].local_sha.c_str(), ZERO_OID) == 0;
+            branches.data[index].future_sha = String::from(updates.data[i].local_sha.c_str());
+        } else if (strcmp(updates.data[i].local_sha.c_str(), ZERO_OID) != 0 &&
+            !name_in_list(updates.data[i].remote_name.c_str(), releases) &&
+            !is_ancestor(updates.data[i].local_sha.c_str(), base_sha.c_str())) {
+            // New destination branches have no remote tip but still participate
+            // when another branch in their stack moves in this push.
+            branches.push(Branch {
+                name: String::from(updates.data[i].remote_name.c_str()),
+                history_sha: String::from(updates.data[i].local_sha.c_str()),
+                remote_sha: String::from(""),
+                future_sha: String::from(updates.data[i].local_sha.c_str()),
+                local_sha: String::from(""),
+                parent: -1,
+                depth: 0,
+                pushed: true,
+                deleted: false,
+                stale: false,
+                needs_sync: false
+            });
+        }
+        i = i + 1;
+    }
+    if (!infer_parents(&branches, history_base_sha.c_str())) return 1;
+    mark_stale_branches(&branches);
+
+    // --- Report drift and let the user continue or abort. ---
+    let stale_count = 0;
+    i = 0;
+    while (i < branches.len) {
+        if (branches.data[i].stale) {
+            stale_count = stale_count + 1;
+            let parent = branches.data[i].parent;
+            let parent_name: char* = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
+            let push_note: char* = " (OMITTED from this push)";
+            if (branches.data[i].pushed) push_note = " (included in this push)";
+            fprintf(stderr, "• %s must be restacked onto %s%s\n",
+                branches.data[i].name.c_str(), parent_name, push_note);
+        }
+        i = i + 1;
+    }
+    if (stale_count == 0) {
+        fprintf(stderr, "Stack check passed.\n");
+        return 0;
+    }
+
+    let tty = fopen("/dev/tty", "r+");
+    if (tty == NULL) return fail("push would unstack branches; aborting because no interactive terminal is available.");
+    fprintf(tty, "\nPush would unstack %d branch(es).\n", stale_count);
+    fprintf(tty, "  [p] continue this push without repairing the stack\n");
+    fprintf(tty, "  [a] abort (default)\nChoice: ");
+    fflush(tty);
+    let answer: char[32];
+    answer[0] = 0;
+    if (fgets((char*)answer, 32, tty) == NULL) answer[0] = 0;
+    fclose(tty);
+    if (answer[0] == 'p' || answer[0] == 'P') return 0;
+    return fail("push aborted.");
+}
+
+/// Implements the active stack-push workflow. The entire function is omitted
+/// at compile time when building the check-only executable.
+@cfg(stack_push)
+fn run_stack_push(argc: int, argv: string*) -> int {
+    // --- Parse configuration and command-line arguments. ---
+    // stack-push accepts a configured remote as its first positional argument.
+    let remote: string = "origin";
+    let remote_explicit: bool = false;
+    let auto_yes: bool = false;
+    let allow_rewrite: bool = false;
+    let do_fetch: bool = true;
+    let base: char* = "master";
+    let releases: char* = "dev test release master main";
+    let targets = Vec<String>::new();
+    let arg_index = 1;
+    while (arg_index < argc) {
+        if (strcmp(argv[arg_index], "-y") == 0 || strcmp(argv[arg_index], "--yes") == 0) {
+            auto_yes = true;
+        } else if (strcmp(argv[arg_index], "-f") == 0 || strcmp(argv[arg_index], "--force") == 0) {
+            allow_rewrite = true;
+        } else if (strcmp(argv[arg_index], "--no-fetch") == 0) {
+            do_fetch = false;
+        } else if (strncmp(argv[arg_index], "--remote=", 9) == 0) {
+            remote = argv[arg_index] + 9;
+            remote_explicit = true;
+        } else if (strncmp(argv[arg_index], "--base=", 7) == 0) {
+            base = argv[arg_index] + 7;
+        } else if (strncmp(argv[arg_index], "--release-branches=", 19) == 0) {
+            releases = argv[arg_index] + 19;
+        } else if (strcmp(argv[arg_index], "-h") == 0 || strcmp(argv[arg_index], "--help") == 0) {
+            fprintf(stdout, "Usage: stack-push [options] [remote] [branch ...]\n");
+            fprintf(stdout, "  -y, --yes                 restack without prompting\n");
+            fprintf(stdout, "  -f, --force               allow removal of commits present when the command started\n");
+            fprintf(stdout, "      --no-fetch            use existing remote-tracking refs\n");
+            fprintf(stdout, "      --remote=NAME         push remote (default: origin)\n");
+            fprintf(stdout, "      --base=BRANCH         stack base (default: master)\n");
+            fprintf(stdout, "      --release-branches=LIST  space-separated excluded branches\n");
+            return 0;
+        } else if (argv[arg_index][0] == '-') {
+            return fail("unknown option; use --help for usage.");
+        } else {
+            targets.push(String::from(argv[arg_index]));
+        }
+        arg_index = arg_index + 1;
+    }
+
+    // --- Resolve the exact remote branch updates being proposed. ---
+    // stack-push turns branch arguments into the same destination/SHA records
+    // that Git supplies to a pre-push hook on stdin.
+    let updates = Vec<Update>::new();
+    let ok = false;
+    let target_start: usize = 0;
+    if (targets.len > 0 && remote_explicit == false) {
+        let remote_key = String::from("remote.");
+        remote_key.append_c(targets.data[0].c_str());
+        remote_key.append_c(".url");
+        let probe = String::from("git config --get ");
+        probe.append_c(shell_arg(remote_key.c_str()).c_str());
+        probe.append_c(" >/dev/null 2>&1");
+        if (command_status(probe.c_str())) {
+            remote = targets.data[0].c_str();
+            target_start = 1;
+        }
+    }
+    if (targets.len == target_start) {
+        // `symbolic-ref` returns the checked-out branch without guessing from
+        // HEAD's commit, and fails cleanly for a detached checkout.
+        let current = command_output("git symbolic-ref --quiet --short HEAD 2>/dev/null", &ok);
+        if (!ok) return fail("could not determine the current branch.");
+        trim_eol(&current);
+        targets.push(String::from(current.c_str()));
+    }
+    let target_index: usize = target_start;
+    while (target_index < targets.len) {
+        let rev_parse = String::from("git rev-parse --verify ");
+        let local_branch_ref = String::from("refs/heads/");
+        local_branch_ref.append_c(targets.data[target_index].c_str());
+        rev_parse.append_c(shell_arg(local_branch_ref.c_str()).c_str());
+        rev_parse.append_c(" 2>/dev/null");
+        let sha = command_output(rev_parse.c_str(), &ok);
+        if (!ok) return fail("a requested local branch could not be resolved.");
+        trim_eol(&sha);
+        updates.push(Update {
+            local_sha: String::from(sha.c_str()),
+            remote_name: String::from(targets.data[target_index].c_str()),
+            fetched_remote_sha: String::from(""),
+            sync_base_sha: String::from(""),
+            needs_sync: false
+        });
+        target_index = target_index + 1;
+    }
+
+    // --- Fetch complete branch and commit history for the selected remote. ---
+    // An explicit wildcard refspec avoids missing stacks in single-branch or
+    // otherwise restricted clones. A shallow repository is unshallowed instead
+    // of relying on a time window; ancestry checks then cover all history.
+    let q_remote = shell_arg(remote);
+    let command = String::from("git remote get-url ");
+    command.append_c(q_remote.c_str());
+    command.append_c(" >/dev/null 2>&1");
+    if (!command_status(command.c_str())) return fail("the push remote must be a configured Git remote.");
+
+    let starting_tips = load_remote_tips(remote, &ok);
+    if (!ok) return fail("could not snapshot remote-tracking branches before fetch.");
+
+    if (do_fetch == true) {
+        let shallow = command_output("git rev-parse --is-shallow-repository 2>/dev/null", &ok);
+        let fetch_refspec = String::from("+refs/heads/*:refs/remotes/");
+        fetch_refspec.append_c(remote);
+        fetch_refspec.append_c("/*");
+        command = String::from("git fetch --quiet --prune ");
+        if (ok && strncmp(shallow.c_str(), "true", 4) == 0) command.append_c("--unshallow ");
+        command.append_c(q_remote.c_str());
+        command.append_c(" ");
+        command.append_c(shell_arg(fetch_refspec.c_str()).c_str());
+        if (!command_status(command.c_str())) return fail("failed to fetch complete history from the push remote.");
+    }
+
+    let fetched_tips = load_remote_tips(remote, &ok);
+    if (!ok) return fail("could not read remote-tracking branches after fetch.");
+
+    // Classify requested branches against both snapshots. --force authorizes
+    // rewriting only the state visible when the command started; it never
+    // authorizes dropping commits that arrived during this command.
+    let sync_count = 0;
+    let update_index: usize = 0;
+    while (update_index < updates.len) {
+        let start_index = tip_index(&starting_tips, updates.data[update_index].remote_name.c_str());
+        let fetch_index = tip_index(&fetched_tips, updates.data[update_index].remote_name.c_str());
+        let starting_sha: char* = "";
+        if (start_index >= 0) starting_sha = starting_tips.data[start_index].sha.c_str();
+        if (fetch_index >= 0) {
+            updates.data[update_index].fetched_remote_sha = String::from(fetched_tips.data[fetch_index].sha.c_str());
+        }
+
+        let fetched_sha = updates.data[update_index].fetched_remote_sha.c_str();
+        let local_sha = updates.data[update_index].local_sha.c_str();
+        let remote_changed = strcmp(starting_sha, fetched_sha) != 0;
+        if (remote_changed) {
+            if (strlen(starting_sha) == 0 || strlen(fetched_sha) == 0) {
+                fprintf(stderr, "Error: %s/%s appeared or disappeared while stack-push was fetching; inspect it and retry.\n",
+                    remote, updates.data[update_index].remote_name.c_str());
+                return 1;
+            }
+            if (is_ancestor(fetched_sha, local_sha)) {
+                // The local branch already contains the newly fetched tip.
+            } else if (is_ancestor(starting_sha, fetched_sha) && is_ancestor(starting_sha, local_sha)) {
+                updates.data[update_index].needs_sync = true;
+                updates.data[update_index].sync_base_sha = String::from(starting_sha);
+                sync_count = sync_count + 1;
+            } else {
+                fprintf(stderr, "Error: %s/%s and its local branch both changed while fetching; resolve them manually and retry.\n",
+                    remote, updates.data[update_index].remote_name.c_str());
+                return 1;
+            }
+        } else if (strlen(fetched_sha) > 0 && !is_ancestor(fetched_sha, local_sha)) {
+            if (!allow_rewrite) {
+                fprintf(stderr, "Error: local %s would remove commits from %s/%s; rerun with --force if intentional.\n",
+                    updates.data[update_index].remote_name.c_str(), remote, updates.data[update_index].remote_name.c_str());
+                return 1;
+            }
+        }
+        update_index = update_index + 1;
+    }
+
+    // Resolve the base to an object ID once; all later ancestry commands use
+    // immutable object IDs rather than refs that another Git process can move.
+    let base_ref = String::from("refs/remotes/");
+    base_ref.append_c(remote);
+    base_ref.append_c("/");
+    base_ref.append_c(base);
+    command = String::from("git rev-parse --verify ");
+    command.append_c(shell_arg(base_ref.c_str()).c_str());
+    command.append_c(" 2>/dev/null");
+    let base_sha = command_output(command.c_str(), &ok);
+    if (!ok) return fail("the configured base branch has no remote-tracking ref.");
+    trim_eol(&base_sha);
+    let history_base_sha = String::from(base_sha.c_str());
+    let starting_base_index = tip_index(&starting_tips, base);
+    if (starting_base_index >= 0) {
+        history_base_sha = String::from(starting_tips.data[starting_base_index].sha.c_str());
+    }
+
+    // --- Enumerate every active remote branch, not only pushed branches. ---
+    // `for-each-ref --no-merged=<base>` omits completed branches whose tips are
+    // already reachable from the base while retaining all open stack branches.
+    command = String::from("git for-each-ref '--format=%(refname:strip=3) %(objectname)' --no-merged=");
+    command.append_c(base_sha.c_str());
+    command.append_c(" ");
+    let remote_prefix = String::from("refs/remotes/");
+    remote_prefix.append_c(remote);
+    command.append_c(shell_arg(remote_prefix.c_str()).c_str());
+    command.append_c(" 2>/dev/null");
+    let listing = command_output(command.c_str(), &ok);
+    if (!ok) return fail("could not enumerate remote branches.");
+
+    let branches = Vec<Branch>::new();
+    let listing_copy = String::from(listing.c_str());
+    let row = strtok(listing_copy.c_str(), "\r\n");
+    while (row != NULL) {
+        let separator = strchr(row, ' ');
+        if (separator != NULL) {
+            *separator = 0;
+            let sha: char* = separator + 1;
+            let excluded = strcmp(row, "HEAD") == 0 || name_in_list(row, releases);
+            if (!excluded) {
+                let history_sha = String::from(sha);
+                let starting_index = tip_index(&starting_tips, row);
+                if (starting_index >= 0) {
+                    history_sha = String::from(starting_tips.data[starting_index].sha.c_str());
+                }
+                branches.push(Branch {
+                    name: String::from(row),
+                    history_sha: String::from(history_sha.c_str()),
+                    remote_sha: String::from(sha),
+                    future_sha: String::from(sha),
+                    local_sha: String::from(""),
+                    parent: -1,
+                    depth: 0,
+                    pushed: false,
+                    deleted: false,
+                    stale: false,
+                    needs_sync: false
+                });
+            }
+        }
+        row = strtok(NULL, "\r\n");
+    }
+
+    // --- Apply the proposed push tips to the historical branch snapshot. ---
+    // Branches absent from the update retain their remote tips, which is what
+    // makes omitted descendants detectable.
+    let i: usize = 0;
+    while (i < updates.len) {
+        let index = branch_index(&branches, updates.data[i].remote_name.c_str());
+        if (index >= 0) {
+            branches.data[index].pushed = true;
+            branches.data[index].deleted = strcmp(updates.data[i].local_sha.c_str(), ZERO_OID) == 0;
+            branches.data[index].future_sha = String::from(updates.data[i].local_sha.c_str());
+            branches.data[index].local_sha = String::from(updates.data[i].local_sha.c_str());
+        } else if (strcmp(updates.data[i].local_sha.c_str(), ZERO_OID) != 0 &&
+            !name_in_list(updates.data[i].remote_name.c_str(), releases) &&
+            !is_ancestor(updates.data[i].local_sha.c_str(), base_sha.c_str())) {
+            // A new destination branch has no remote tip to enumerate, but it
+            // must still participate when another branch in its stack moves.
+            branches.push(Branch {
+                name: String::from(updates.data[i].remote_name.c_str()),
+                history_sha: String::from(updates.data[i].local_sha.c_str()),
+                remote_sha: String::from(""),
+                future_sha: String::from(updates.data[i].local_sha.c_str()),
+                local_sha: String::from(updates.data[i].local_sha.c_str()),
+                parent: -1,
+                depth: 0,
+                pushed: true,
+                deleted: false,
+                stale: false,
+                needs_sync: false
+            });
+        }
+        i = i + 1;
+    }
+
+    // --- Infer historical parent edges and compare their post-push tips. ---
+    if (!infer_parents(&branches, history_base_sha.c_str())) return 1;
+    let max_depth = mark_stale_branches(&branches);
+
+    // --- Protect omitted descendants before adding them to stack-push. ---
+    // A local branch is preferred because it may contain unpublished work, but
+    // it cannot silently replace fetched commits. The same command-start
+    // boundary and concurrent-update rules used for requested branches apply.
+    i = 0;
+    while (i < branches.len) {
+        if (branches.data[i].stale && !branches.data[i].pushed) {
+            let branch_ref = String::from("refs/heads/");
+            branch_ref.append_c(branches.data[i].name.c_str());
+            command = String::from("git rev-parse --verify ");
+            command.append_c(shell_arg(branch_ref.c_str()).c_str());
+            command.append_c(" 2>/dev/null");
+            branches.data[i].local_sha = command_output(command.c_str(), &ok);
+            if (ok) {
+                trim_eol(&branches.data[i].local_sha);
+                let start_index = tip_index(&starting_tips, branches.data[i].name.c_str());
+                if (start_index < 0) {
+                    fprintf(stderr, "Error: %s/%s appeared while stack-push was fetching; inspect it and retry.\n",
+                        remote, branches.data[i].name.c_str());
+                    return 1;
+                }
+
+                let starting_sha = branches.data[i].history_sha.c_str();
+                let fetched_sha = branches.data[i].remote_sha.c_str();
+                let local_sha = branches.data[i].local_sha.c_str();
+                if (strcmp(starting_sha, fetched_sha) != 0) {
+                    if (is_ancestor(fetched_sha, local_sha)) {
+                        // The local descendant already includes the new tip.
+                    } else if (is_ancestor(starting_sha, fetched_sha) && is_ancestor(starting_sha, local_sha)) {
+                        branches.data[i].needs_sync = true;
+                        sync_count = sync_count + 1;
+                    } else {
+                        fprintf(stderr, "Error: omitted branch %s and %s/%s both changed while fetching; resolve them manually and retry.\n",
+                            branches.data[i].name.c_str(), remote, branches.data[i].name.c_str());
+                        return 1;
+                    }
+                } else if (!is_ancestor(fetched_sha, local_sha) && !allow_rewrite) {
+                    fprintf(stderr, "Error: local %s would remove commits from %s/%s; rerun with --force if intentional.\n",
+                        branches.data[i].name.c_str(), remote, branches.data[i].name.c_str());
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // --- Report drift and choose whether to stop, repair, or override. ---
+    i = 0;
+    while (i < updates.len) {
+        if (updates.data[i].needs_sync) {
+            fprintf(stderr, "• %s received remote commits during fetch; local commits must be replayed onto %s/%s\n",
+                updates.data[i].remote_name.c_str(), remote, updates.data[i].remote_name.c_str());
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < branches.len) {
+        if (branches.data[i].needs_sync) {
+            fprintf(stderr, "• %s received remote commits during fetch; local commits must be replayed onto %s/%s\n",
+                branches.data[i].name.c_str(), remote, branches.data[i].name.c_str());
+        }
+        i = i + 1;
+    }
+    let stale_count: int = 0;
+    i = 0;
+    while (i < branches.len) {
+        if (branches.data[i].stale) {
+            stale_count = stale_count + 1;
+            let parent = branches.data[i].parent;
+            let parent_name: char* = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
+            let push_note: char* = " (OMITTED from this push)";
+            if (branches.data[i].pushed) push_note = " (included in this push)";
+            fprintf(stderr, "• %s must be restacked onto %s%s\n",
+                branches.data[i].name.c_str(), parent_name, push_note);
+        }
+        i = i + 1;
+    }
+    let work_count = stale_count + sync_count;
+    let do_restack: bool = work_count > 0;
+    let answer: char[32];
+    answer[0] = 0;
+    if (auto_yes == true) answer[0] = 'r';
+    if (work_count > 0 && auto_yes == false) {
+        let tty = fopen("/dev/tty", "r+");
+        if (tty == NULL) return fail("push would unstack branches; aborting because no interactive terminal is available.");
+        fprintf(tty, "\nStack push requires %d local update(s).\n", work_count);
+        fprintf(tty, "  [r] restack and push every affected branch\n");
+        if (sync_count == 0) {
+            fprintf(tty, "  [p] push anyway, leaving the stack broken\n");
+        }
+        fprintf(tty, "  [a] abort (default)\nChoice: ");
+        fflush(tty);
+        if (fgets((char*)answer, 32, tty) == NULL) answer[0] = 0;
+        fclose(tty);
+    }
+    if ((answer[0] == 'p' || answer[0] == 'P') && sync_count == 0) do_restack = false;
+    if (work_count > 0 && answer[0] != 'r' && answer[0] != 'R' &&
+        (answer[0] != 'p' || sync_count > 0) && (answer[0] != 'P' || sync_count > 0)) {
+        return fail("push aborted.");
+    }
+
+    // --- Restack affected local branches from roots toward leaves. ---
+    // `rebase --onto NEW OLD BRANCH` moves only BRANCH's commits after the old
+    // parent tip; plain `rebase NEW BRANCH` could accidentally replay the old
+    // parent's commits after that parent was rewritten.
+    if (do_restack == true) {
+        // Porcelain status is stable for scripts; any output means a rebase
+        // could mix the user's uncommitted files with rewritten branch tips.
+        if (command_output("git status --porcelain --untracked-files=normal", &ok).length() > 0) {
+            return fail("automatic restacking requires a clean working tree.");
+        }
+
+        // Preserve either the checked-out branch name or detached HEAD object.
+        command = String::from("git symbolic-ref --quiet --short HEAD 2>/dev/null");
+        let restore = command_output(command.c_str(), &ok);
+        if (!ok) restore = command_output("git rev-parse HEAD 2>/dev/null", &ok);
+        trim_eol(&restore);
+
+        // Record every affected local tip once before changing any branch. The
+        // abbreviated SHAs give the user a compact manual recovery reference.
+        fprintf(stderr, "\nLocal branch tips before restacking:\n");
+        i = 0;
+        while (i < updates.len) {
+            if (updates.data[i].needs_sync) {
+                fprintf(stderr, "  %s [%.7s]\n", updates.data[i].remote_name.c_str(), updates.data[i].local_sha.c_str());
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < branches.len) {
+            if (branches.data[i].stale) {
+                let already_printed = false;
+                let printed_index: usize = 0;
+                while (printed_index < updates.len) {
+                    if (updates.data[printed_index].needs_sync &&
+                        strcmp(updates.data[printed_index].remote_name.c_str(), branches.data[i].name.c_str()) == 0) {
+                        already_printed = true;
+                        break;
+                    }
+                    printed_index = printed_index + 1;
+                }
+                if (!already_printed) {
+                    if (branches.data[i].local_sha.length() > 0) {
+                        fprintf(stderr, "  %s [%.7s]\n", branches.data[i].name.c_str(), branches.data[i].local_sha.c_str());
+                    } else {
+                        fprintf(stderr, "  %s [missing]\n", branches.data[i].name.c_str());
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        fprintf(stderr, "\n");
+
+        // Integrate only remote commits that appeared after this command
+        // started. The old snapshot is the precise boundary for local commits.
+        i = 0;
+        while (i < updates.len) {
+            if (updates.data[i].needs_sync) {
+                fprintf(stderr, "%s → replaying local commits onto updated %s/%s\n",
+                    updates.data[i].remote_name.c_str(), remote, updates.data[i].remote_name.c_str());
+                if (replay_commits(updates.data[i].remote_name.c_str(), updates.data[i].fetched_remote_sha.c_str(),
+                    updates.data[i].sync_base_sha.c_str(), restore.c_str(), &updates.data[i].local_sha) != 0) return 1;
+                let index = branch_index(&branches, updates.data[i].remote_name.c_str());
+                if (index >= 0) {
+                    branches.data[index].future_sha = String::from(updates.data[i].local_sha.c_str());
+                    branches.data[index].local_sha = String::from(updates.data[i].local_sha.c_str());
+                }
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < branches.len) {
+            if (branches.data[i].needs_sync) {
+                fprintf(stderr, "%s → replaying local commits onto updated %s/%s\n",
+                    branches.data[i].name.c_str(), remote, branches.data[i].name.c_str());
+                if (replay_commits(branches.data[i].name.c_str(), branches.data[i].remote_sha.c_str(),
+                    branches.data[i].history_sha.c_str(), restore.c_str(), &branches.data[i].local_sha) != 0) return 1;
+                branches.data[i].future_sha = String::from(branches.data[i].local_sha.c_str());
+            }
+            i = i + 1;
+        }
+
+        let rebase_depth = 0;
+        while (rebase_depth <= max_depth) {
+            i = 0;
+            while (i < branches.len) {
+                if (branches.data[i].stale && branches.data[i].depth == rebase_depth) {
+                    let parent = branches.data[i].parent;
+                    if (branches.data[i].local_sha.length() == 0) {
+                        fprintf(stderr, "%s ← creating local branch from %s/%s\n",
+                            branches.data[i].name.c_str(), remote, branches.data[i].name.c_str());
+                        command = String::from("git branch ");
+                        let q_name = shell_arg(branches.data[i].name.c_str());
+                        command.append_c(q_name.c_str());
+                        command.append_c(" ");
+                        command.append_c(branches.data[i].remote_sha.c_str());
+                        if (!command_status(command.c_str())) return fail("could not create a local branch needed for restacking.");
+                        branches.data[i].local_sha = String::from(branches.data[i].remote_sha.c_str());
+                    }
+
+                    // An omitted branch may already be correctly restacked
+                    // locally. In that case it only needs to join the push.
+                    let parent_sha: char* = if (parent >= 0) { branches.data[parent].future_sha.c_str() } else { base_sha.c_str() };
+                    let parent_name: char* = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
+                    let already_stacked = is_ancestor(parent_sha, branches.data[i].local_sha.c_str());
+                    if (already_stacked && parent >= 0 &&
+                        !is_ancestor(branches.data[parent].history_sha.c_str(), parent_sha) &&
+                        is_ancestor(branches.data[parent].history_sha.c_str(), branches.data[i].local_sha.c_str())) {
+                        already_stacked = false;
+                    }
+                    if (already_stacked) {
+                        fprintf(stderr, "%s ✓ already stacked on %s\n", branches.data[i].name.c_str(), parent_name);
+                        branches.data[i].future_sha = String::from(branches.data[i].local_sha.c_str());
+                        i = i + 1;
+                        continue;
+                    }
+
+                    fprintf(stderr, "%s → rebasing onto %s\n", branches.data[i].name.c_str(), parent_name);
+                    let old_parent: char* = if (parent >= 0) {
+                        branches.data[parent].history_sha.c_str()
+                    } else {
+                        history_base_sha.c_str()
+                    };
+                    if (replay_commits(branches.data[i].name.c_str(), parent_sha, old_parent,
+                        restore.c_str(), &branches.data[i].future_sha) != 0) return 1;
+                    branches.data[i].local_sha = String::from(branches.data[i].future_sha.c_str());
+                }
+                i = i + 1;
+            }
+            rebase_depth = rebase_depth + 1;
+        }
+
+        // `checkout` accepts both a branch name and a detached commit ID.
+        command = String::from("git checkout --quiet ");
+        command.append_c(shell_arg(restore.c_str()).c_str());
+        if (!command_status(command.c_str())) return fail("restacked branches but could not restore the original checkout.");
+    }
+
+    // --- Push requested and repaired branches as one guarded transaction. ---
+    // Explicit `--force-with-lease=<ref>:<old-tip>` values avoid Git's heuristic
+    // lease lookup, which can miss refs outside a clone's configured fetch
+    // refspec. `--atomic` prevents one branch updating if another is rejected.
+    // A child-scoped environment variable skips only stack-check when the
+    // pre-push hook runs; every unrelated hook validation still executes.
+    command = String::from("git push --quiet --atomic ");
+    i = 0;
+    while (i < branches.len) {
+        if (do_restack && branches.data[i].stale && !branches.data[i].pushed) {
+            append_lease(&command, branches.data[i].name.c_str(), branches.data[i].remote_sha.c_str());
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < updates.len) {
+        append_lease(&command, updates.data[i].remote_name.c_str(), updates.data[i].fetched_remote_sha.c_str());
+        i = i + 1;
+    }
+    command.append_c(q_remote.c_str());
+
+    i = 0;
+    while (i < branches.len) {
+        if (do_restack && branches.data[i].stale && !branches.data[i].pushed) {
+            append_refspec(&command, branches.data[i].name.c_str());
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < updates.len) {
+        append_refspec(&command, updates.data[i].remote_name.c_str());
+        i = i + 1;
+    }
+    setenv("STACK_CHECK_SKIP", "1", 1);
+    let push_ok = command_status(command.c_str());
+    unsetenv("STACK_CHECK_SKIP");
+    if (!push_ok) return fail("the stack push failed.");
+    if (!do_restack && stale_count > 0) {
+        fprintf(stderr, "Pushed requested branches without restacking.\n");
+        return 0;
+    }
+    let action_text: char* = "Checked";
+    if (do_restack == true) action_text = "Restacked";
+    fprintf(stderr, "%s and pushed all affected branches.\n", action_text);
+    return 0;
+}

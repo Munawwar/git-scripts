@@ -74,3 +74,24 @@ long running branch means e.g a branch that touches 100s of files that is taking
 # close-release.sh
 
 After deploying from release branch, this script traverses through all git repos and creates a "backup" branch from master's commit and merges the release branch to master. 
+
+# stack-check and stack-push
+
+- `stack-check.com` is a `pre-push` hook that warns when a push would break a
+  branch stack and lets you continue or abort.
+- `stack-push.com` rebases affected branches into the correct stack order and
+  pushes them together safely.
+
+```sh
+install -m755 stack-check.com ~/.local/bin/stack-check
+install -m755 stack-push.com ~/.local/bin/stack-push
+cp stack-check.com /path/to/repository/.git/hooks/pre-push
+chmod +x /path/to/repository/.git/hooks/pre-push
+alias scheck='stack-check'
+alias spush='stack-push'
+stack-push feature-a
+stack-push -y origin feature-a feature-b
+```
+
+See [stack-src/README.md](stack-src/README.md) for configuration, safety
+behavior, stack detection, all options, and build instructions.

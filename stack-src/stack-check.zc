@@ -1,0 +1,6 @@
+import "./shared.zc"
+
+/// Runs stack validation as Git's non-mutating pre-push hook.
+fn main(argc: int, argv: string*) -> int {
+    return run_stack_check(argc, argv);
+}
