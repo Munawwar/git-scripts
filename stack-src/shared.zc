@@ -43,7 +43,7 @@ struct RemoteTip {
 /// Returns one POSIX-shell argument with all embedded single quotes escaped.
 /// Git permits shell metacharacters in ref names, so every dynamic value passed
 /// through `system` or `popen` must go through this function.
-fn shell_arg(value: char*) -> String {
+fn shell_arg(value: string) -> String {
     let quoted = String::from("'");
     let i: usize = 0;
     while (value[i] != 0) {
@@ -64,7 +64,7 @@ fn shell_arg(value: char*) -> String {
 /// Runs a shell command, captures stdout, and reports whether it exited zero.
 /// Callers explicitly add `2>/dev/null` or `2>&1` when they want to redirect
 /// stderr; keeping that choice at each call site prevents hidden diagnostics.
-fn command_output(command: char*, ok: bool*) -> String {
+fn command_output(command: string, ok: bool*) -> String {
     let stream = popen(command, "r");
     let output = String::from("");
     if (stream == NULL) {
@@ -82,7 +82,7 @@ fn command_output(command: char*, ok: bool*) -> String {
 
 /// Runs a shell command without capturing its output and returns true on
 /// success. Interactive Git operations use this so Git retains the terminal.
-fn command_status(command: char*) -> bool {
+fn command_status(command: string) -> bool {
     let status = system(command);
     return status == 0;
 }
@@ -90,7 +90,7 @@ fn command_status(command: char*) -> bool {
 /// Returns whether one commit is reachable from another. The uncommon
 /// `merge-base --is-ancestor A B` command exits zero exactly when A is part of
 /// B's history, without producing or parsing human-readable output.
-fn is_ancestor(ancestor: char*, descendant: char*) -> bool {
+fn is_ancestor(ancestor: string, descendant: string) -> bool {
     let command = String::from("git merge-base --is-ancestor ");
     command.append_c(ancestor);
     command.append_c(" ");
@@ -101,7 +101,7 @@ fn is_ancestor(ancestor: char*, descendant: char*) -> bool {
 
 /// Finds a branch by its remote name or returns -1 when it is not in the active
 /// graph. This is shared by update application and explicit lease generation.
-fn branch_index(branches: Vec<Branch>*, name: char*) -> int {
+fn branch_index(branches: Vec<Branch>*, name: string) -> int {
     let i: usize = 0;
     while (i < branches.len) {
         if (strcmp(branches.data[i].name.c_str(), name) == 0) return (int)i;
@@ -111,7 +111,7 @@ fn branch_index(branches: Vec<Branch>*, name: char*) -> int {
 }
 
 /// Finds a captured remote tip by branch name or returns -1 when absent.
-fn tip_index(tips: Vec<RemoteTip>*, name: char*) -> int {
+fn tip_index(tips: Vec<RemoteTip>*, name: string) -> int {
     let i: usize = 0;
     while (i < tips.len) {
         if (strcmp(tips.data[i].name.c_str(), name) == 0) return (int)i;
@@ -122,12 +122,12 @@ fn tip_index(tips: Vec<RemoteTip>*, name: char*) -> int {
 
 /// Returns whether a branch name appears as one whole whitespace-separated
 /// item. This avoids substring matches such as `test` matching `test-next`.
-fn name_in_list(name: char*, list: char*) -> bool {
+fn name_in_list(name: string, list: string) -> bool {
     let name_length = strlen(name);
-    let cursor: char* = list;
+    let cursor: string = list;
     while (*cursor != 0) {
         while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') cursor = cursor + 1;
-        let end: char* = cursor;
+        let end: string = cursor;
         while (*end != 0 && *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') end = end + 1;
         if ((usize)(end - cursor) == name_length && strncmp(cursor, name, name_length) == 0) return true;
         cursor = end;
@@ -137,7 +137,7 @@ fn name_in_list(name: char*, list: char*) -> bool {
 
 /// Appends one explicit force-with-lease option to a pending push command.
 @cfg(stack_push)
-fn append_lease(command: String*, name: char*, expected_sha: char*) {
+fn append_lease(command: String*, name: string, expected_sha: string) {
     let lease = String::from("--force-with-lease=refs/heads/");
     lease.append_c(name);
     lease.append_c(":");
@@ -148,7 +148,7 @@ fn append_lease(command: String*, name: char*, expected_sha: char*) {
 
 /// Appends a same-name local-to-remote branch refspec to a push command.
 @cfg(stack_push)
-fn append_refspec(command: String*, name: char*) {
+fn append_refspec(command: String*, name: string) {
     let refspec = String::from(name);
     refspec.append_c(":refs/heads/");
     refspec.append_c(name);
@@ -167,7 +167,7 @@ fn trim_eol(value: String*) {
 }
 
 /// Prints a consistent error and returns the nonzero process status.
-fn fail(message: char*) -> int {
+fn fail(message: string) -> int {
     fprintf(stderr, "Error: %s\n", message);
     return 1;
 }
@@ -176,7 +176,7 @@ fn fail(message: char*) -> int {
 /// `tip`. On conflict, only this failed rebase is aborted before checkout is
 /// restored; earlier successful branch updates remain intact.
 @cfg(stack_push)
-fn replay_commits(name: char*, new_base: char*, old_base: char*, restore: char*, tip: String*) -> int {
+fn replay_commits(name: string, new_base: string, old_base: string, restore: string, tip: String*) -> int {
     let command = String::from("git rebase --onto ");
     command.append_c(new_base);
     command.append_c(" ");
@@ -216,7 +216,7 @@ fn replay_commits(name: char*, new_base: char*, old_base: char*, restore: char*,
 /// Captures every currently known remote-tracking branch and object ID. Taking
 /// this snapshot before fetch preserves both the command-start lease boundary
 /// and stack relationships that a concurrent remote update might break.
-fn load_remote_tips(remote: char*, ok: bool*) -> Vec<RemoteTip> {
+fn load_remote_tips(remote: string, ok: bool*) -> Vec<RemoteTip> {
     let prefix = String::from("refs/remotes/");
     prefix.append_c(remote);
     let command = String::from("git for-each-ref '--format=%(refname:strip=3) %(objectname)' ");
@@ -248,7 +248,7 @@ fn load_remote_tips(remote: char*, ok: bool*) -> Vec<RemoteTip> {
 /// equal-distance ties. Other branch names at the same commit are equivalent;
 /// a branch participating in this push wins that tie. Divergent equally-near
 /// parents are rejected because one linear rebase cannot preserve both.
-fn infer_parents(branches: Vec<Branch>*, base_sha: char*) -> bool {
+fn infer_parents(branches: Vec<Branch>*, base_sha: string) -> bool {
     let ok = false;
     let i: usize = 0;
     while (i < branches.len) {
@@ -361,8 +361,8 @@ fn run_stack_check(argc: int, argv: string*) -> int {
     let remote: string = "origin";
     let remote_explicit = false;
     let do_fetch = true;
-    let base: char* = "master";
-    let releases: char* = "dev test release master main";
+    let base: string = "master";
+    let releases: string = "dev test release master main";
     let targets = Vec<String>::new();
     let arg_index = 1;
     while (arg_index < argc) {
@@ -394,8 +394,8 @@ fn run_stack_check(argc: int, argv: string*) -> int {
         // Git provides: <local-ref> <local-sha> <remote-ref> <remote-sha>.
         // Only destination branches can participate in a branch stack.
         strtok((char*)line, " \t\r\n");
-        let local_sha: char* = strtok(NULL, " \t\r\n");
-        let remote_ref: char* = strtok(NULL, " \t\r\n");
+        let local_sha: string = strtok(NULL, " \t\r\n");
+        let remote_ref: string = strtok(NULL, " \t\r\n");
         strtok(NULL, " \t\r\n");
         if (local_sha == NULL || remote_ref == NULL) continue;
         if (strncmp(remote_ref, "refs/heads/", 11) != 0) continue;
@@ -469,7 +469,7 @@ fn run_stack_check(argc: int, argv: string*) -> int {
         let separator = strchr(row, ' ');
         if (separator != NULL) {
             *separator = 0;
-            let sha: char* = separator + 1;
+            let sha: string = separator + 1;
             let excluded = strcmp(row, "HEAD") == 0 || name_in_list(row, releases);
             if (!excluded) {
                 let history_sha = String::from(sha);
@@ -534,8 +534,8 @@ fn run_stack_check(argc: int, argv: string*) -> int {
         if (branches.data[i].stale) {
             stale_count = stale_count + 1;
             let parent = branches.data[i].parent;
-            let parent_name: char* = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
-            let push_note: char* = " (OMITTED from this push)";
+            let parent_name: string = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
+            let push_note: string = " (OMITTED from this push)";
             if (branches.data[i].pushed) push_note = " (included in this push)";
             fprintf(stderr, "• %s must be restacked onto %s%s\n",
                 branches.data[i].name.c_str(), parent_name, push_note);
@@ -572,8 +572,8 @@ fn run_stack_push(argc: int, argv: string*) -> int {
     let auto_yes: bool = false;
     let allow_rewrite: bool = false;
     let do_fetch: bool = true;
-    let base: char* = "master";
-    let releases: char* = "dev test release master main";
+    let base: string = "master";
+    let releases: string = "dev test release master main";
     let targets = Vec<String>::new();
     let arg_index = 1;
     while (arg_index < argc) {
@@ -690,7 +690,7 @@ fn run_stack_push(argc: int, argv: string*) -> int {
     while (update_index < updates.len) {
         let start_index = tip_index(&starting_tips, updates.data[update_index].remote_name.c_str());
         let fetch_index = tip_index(&fetched_tips, updates.data[update_index].remote_name.c_str());
-        let starting_sha: char* = "";
+        let starting_sha: string = "";
         if (start_index >= 0) starting_sha = starting_tips.data[start_index].sha.c_str();
         if (fetch_index >= 0) {
             updates.data[update_index].fetched_remote_sha = String::from(fetched_tips.data[fetch_index].sha.c_str());
@@ -764,7 +764,7 @@ fn run_stack_push(argc: int, argv: string*) -> int {
         let separator = strchr(row, ' ');
         if (separator != NULL) {
             *separator = 0;
-            let sha: char* = separator + 1;
+            let sha: string = separator + 1;
             let excluded = strcmp(row, "HEAD") == 0 || name_in_list(row, releases);
             if (!excluded) {
                 let history_sha = String::from(sha);
@@ -896,8 +896,8 @@ fn run_stack_push(argc: int, argv: string*) -> int {
         if (branches.data[i].stale) {
             stale_count = stale_count + 1;
             let parent = branches.data[i].parent;
-            let parent_name: char* = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
-            let push_note: char* = " (OMITTED from this push)";
+            let parent_name: string = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
+            let push_note: string = " (OMITTED from this push)";
             if (branches.data[i].pushed) push_note = " (included in this push)";
             fprintf(stderr, "• %s must be restacked onto %s%s\n",
                 branches.data[i].name.c_str(), parent_name, push_note);
@@ -1029,8 +1029,8 @@ fn run_stack_push(argc: int, argv: string*) -> int {
 
                     // An omitted branch may already be correctly restacked
                     // locally. In that case it only needs to join the push.
-                    let parent_sha: char* = if (parent >= 0) { branches.data[parent].future_sha.c_str() } else { base_sha.c_str() };
-                    let parent_name: char* = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
+                    let parent_sha: string = if (parent >= 0) { branches.data[parent].future_sha.c_str() } else { base_sha.c_str() };
+                    let parent_name: string = if (parent >= 0) { branches.data[parent].name.c_str() } else { base };
                     let already_stacked = is_ancestor(parent_sha, branches.data[i].local_sha.c_str());
                     if (already_stacked && parent >= 0 &&
                         !is_ancestor(branches.data[parent].history_sha.c_str(), parent_sha) &&
@@ -1045,7 +1045,7 @@ fn run_stack_push(argc: int, argv: string*) -> int {
                     }
 
                     fprintf(stderr, "%s → rebasing onto %s\n", branches.data[i].name.c_str(), parent_name);
-                    let old_parent: char* = if (parent >= 0) {
+                    let old_parent: string = if (parent >= 0) {
                         branches.data[parent].history_sha.c_str()
                     } else {
                         history_base_sha.c_str()
@@ -1106,7 +1106,7 @@ fn run_stack_push(argc: int, argv: string*) -> int {
         fprintf(stderr, "Pushed requested branches without restacking.\n");
         return 0;
     }
-    let action_text: char* = "Checked";
+    let action_text: string = "Checked";
     if (do_restack == true) action_text = "Restacked";
     fprintf(stderr, "%s and pushed all affected branches.\n", action_text);
     return 0;
