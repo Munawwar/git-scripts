@@ -7,21 +7,29 @@ const
   NoTtyError = "push would unstack branches; aborting because no interactive terminal is available."
 
 type
+  ## One active remote branch and its inferred historical stack relationship.
+  ## `historySha` is the command-start tip, `remoteSha` is the post-fetch tip,
+  ## and `futureSha` is the proposed or repaired tip used to detect drift.
   Branch = object
     name, historySha, remoteSha, futureSha, localSha: string
     parent: int
     depth: int
     pushed, deleted, stale, needsSync: bool
 
+  ## One destination branch and object ID proposed by Git or stack-push.
   Update = object
     localSha, remoteName, fetchedRemoteSha, syncBaseSha: string
     needsSync: bool
 
+  ## One remote-tracking tip captured before or after fetching.
   RemoteTip = object
     name, sha: string
 
   CommandResult = tuple[output: string, status: int]
 
+## Runs Git without a shell, so branch and remote names remain literal
+## arguments. Commands that may invoke hooks or show rebase progress inherit
+## the terminal; query commands merge stderr into their captured output.
 proc git(args: openArray[string]; parentStreams = false): CommandResult =
   let options =
     if parentStreams: {poUsePath, poParentStreams}
@@ -57,6 +65,8 @@ proc isAncestor(ancestor, descendant: string): bool =
   ancestor.len > 0 and descendant.len > 0 and
     git(["merge-base", "--is-ancestor", ancestor, descendant]).status == 0
 
+## Captures the lease boundary and historical graph before a fetch can move
+## remote-tracking refs.
 proc loadRemoteTips(remote: string): tuple[tips: seq[RemoteTip], ok: bool] =
   let response = git([
     "for-each-ref",
@@ -71,6 +81,8 @@ proc loadRemoteTips(remote: string): tuple[tips: seq[RemoteTip], ok: bool] =
     if fields.len >= 2 and fields[0] != "HEAD":
       result.tips.add RemoteTip(name: fields[0], sha: fields[1])
 
+## Enumerates open stack branches after fetching. Branches already merged into
+## the base and configured release branches do not participate in restacking.
 proc enumerateBranches(
   remote, baseSha, releases: string;
   startingTips: openArray[RemoteTip]
@@ -100,6 +112,9 @@ proc enumerateBranches(
       parent: -1
     )
 
+## Infers each branch's nearest historical ancestor as its parent. Two names at
+## the same commit are equivalent; a pushed name wins that tie, while divergent
+## equally-near parents are rejected because one linear rebase cannot keep both.
 proc inferParents(branches: var seq[Branch]; baseSha: string): bool =
   for i in 0 ..< branches.len:
     var bestDistance = int.high
@@ -158,6 +173,8 @@ proc inferParents(branches: var seq[Branch]; baseSha: string): bool =
           return false
   true
 
+## Compares historical parent edges with proposed tips, then propagates drift
+## from stale parents to descendants in depth order.
 proc markStaleBranches(branches: var seq[Branch]): int =
   for i in 0 ..< branches.len:
     var cursor = branches[i].parent
@@ -182,6 +199,8 @@ proc markStaleBranches(branches: var seq[Branch]): int =
           parent >= 0 and branches[parent].stale:
         branches[i].stale = true
 
+## Applies proposed tips to the remote graph. A new destination branch is added
+## when it is still open relative to the base, even though no remote tip exists.
 proc applyUpdates(
   branches: var seq[Branch];
   updates: openArray[Update];
@@ -208,6 +227,8 @@ proc applyUpdates(
         pushed: true
       )
 
+## Fetches every remote branch with complete history. Restricted fetch
+## refspecs and shallow clones would otherwise make ancestry checks incomplete.
 proc fetchRemote(remote: string; doFetch: bool): bool =
   if git(["remote", "get-url", remote]).status != 0:
     stderr.writeLine("Error: the push remote must be a configured Git remote.")
@@ -225,6 +246,8 @@ proc fetchRemote(remote: string; doFetch: bool): bool =
     return false
   true
 
+## Resolves the fetched base for future ancestry while retaining its
+## command-start tip for historical parent inference.
 proc resolveBase(
   remote, base: string;
   startingTips: openArray[RemoteTip]
@@ -257,6 +280,9 @@ proc prompt(message: string; choices: openArray[string]):
   except IOError:
     discard
 
+## Replays only commits after `oldBase` onto `newBase`. On failure, aborting the
+## current rebase and restoring the original checkout are attempted separately
+## so the user gets an accurate recovery state.
 proc replayCommits(
   name, newBase, oldBase, restore: string
 ): tuple[tip: string, ok: bool] =
@@ -282,6 +308,7 @@ proc runStackCheck*(): int =
   if existsEnv("STACK_CHECK_SKIP"):
     return 0
 
+  # Parse hook configuration before consuming Git's proposed ref updates.
   var
     remote = "origin"
     remoteExplicit = false
@@ -321,6 +348,8 @@ proc runStackCheck*(): int =
   if updates.len == 0:
     return 0
 
+  # Snapshot first: fetching may move refs and must not rewrite the historical
+  # graph used to decide which parent edge a proposed push would break.
   let initial = loadRemoteTips(remote)
   if not initial.ok:
     return fail("could not snapshot remote-tracking branches before fetch.")
@@ -332,11 +361,15 @@ proc runStackCheck*(): int =
   var branchInfo = enumerateBranches(remote, baseInfo.baseSha, releases, initial.tips)
   if not branchInfo.ok:
     return fail("could not enumerate remote branches.")
+
+  # Evaluate the exact destination SHAs supplied to the hook. The checker never
+  # changes local branches; it only models the graph that would exist afterward.
   applyUpdates(branchInfo.branches, updates, releases, baseInfo.baseSha, false)
   if not inferParents(branchInfo.branches, baseInfo.historyBaseSha):
     return 1
   discard markStaleBranches(branchInfo.branches)
 
+  # Report every broken edge, including descendants omitted from the push.
   var staleCount = 0
   for branch in branchInfo.branches:
     if branch.stale:
@@ -364,6 +397,7 @@ proc runStackCheck*(): int =
   fail("push aborted.")
 
 proc runStackPush*(): int =
+  # Parse configuration and collect the requested local branches.
   var
     remote = "origin"
     remoteExplicit, autoYes, allowRewrite = false
@@ -399,6 +433,8 @@ proc runStackPush*(): int =
     else:
       targets.add arg
 
+  # A configured remote may be the first positional argument. With no branch
+  # arguments, symbolic-ref avoids guessing a branch from a detached HEAD.
   var targetStart = 0
   if targets.len > 0 and not remoteExplicit and
       git(["config", "--get", "remote." & targets[0] & ".url"]).status == 0:
@@ -417,6 +453,8 @@ proc runStackPush*(): int =
       return fail("a requested local branch could not be resolved.")
     updates.add Update(localSha: response.output.strip(), remoteName: targets[i])
 
+  # Keep snapshots from both sides of the fetch. Their difference distinguishes
+  # pre-existing rewrites from commits that arrived while this command ran.
   let initial = loadRemoteTips(remote)
   if not initial.ok:
     return fail("could not snapshot remote-tracking branches before fetch.")
@@ -426,6 +464,9 @@ proc runStackPush*(): int =
   if not fetched.ok:
     return fail("could not read remote-tracking branches after fetch.")
 
+  # A newly fetched tip may already be in the local history. Otherwise, local
+  # commits based on the starting tip must be replayed; unrelated divergence is
+  # rejected even when --force was supplied.
   var syncCount = 0
   for i in 0 ..< updates.len:
     let startIndex = initial.tips.findTip(updates[i].remoteName)
@@ -454,6 +495,8 @@ proc runStackPush*(): int =
       return fail("local " & updates[i].remoteName & " would remove commits from " &
         remote & "/" & updates[i].remoteName & "; rerun with --force if intentional.")
 
+  # Build the complete remote graph, apply requested future tips, and infer
+  # parent edges exclusively from the command-start history.
   let baseInfo = resolveBase(remote, base, initial.tips)
   if not baseInfo.ok:
     return 1
@@ -465,6 +508,8 @@ proc runStackPush*(): int =
     return 1
   let maxDepth = markStaleBranches(branchInfo.branches)
 
+  # Protect omitted stale descendants before adding them to the operation. A
+  # local branch may contain unpublished work, but cannot replace fetched work.
   for i in 0 ..< branchInfo.branches.len:
     if not branchInfo.branches[i].stale or branchInfo.branches[i].pushed:
       continue
@@ -496,6 +541,7 @@ proc runStackPush*(): int =
         " would remove commits from " & remote & "/" & branchInfo.branches[i].name &
         "; rerun with --force if intentional.")
 
+  # Summarize all required local changes before asking for one decision.
   for update in updates:
     if update.needsSync:
       stderr.writeLine("• " & update.remoteName &
@@ -539,6 +585,8 @@ proc runStackPush*(): int =
     return fail("push aborted.")
 
   if doRestack:
+    # No branch is touched until the worktree is clean and the original branch
+    # name or detached commit has been captured for restoration.
     let status = git(["status", "--porcelain", "--untracked-files=normal"])
     if status.status != 0:
       return fail("could not verify that the working tree is clean.")
@@ -551,6 +599,7 @@ proc runStackPush*(): int =
       return fail("could not preserve the current checkout before restacking.")
     let restoreTarget = restore.output.strip()
 
+    # Print compact recovery references once, before changing any local tip.
     stderr.writeLine("\nLocal branch tips before restacking:")
     for update in updates:
       if update.needsSync:
@@ -567,6 +616,8 @@ proc runStackPush*(): int =
         stderr.writeLine("  " & branch.name & " [" & tip & "]")
     stderr.writeLine("")
 
+    # First integrate remote commits that appeared during the fetch. The
+    # starting snapshot is the exact boundary between remote and local work.
     for i in 0 ..< updates.len:
       if not updates[i].needsSync:
         continue
@@ -599,6 +650,8 @@ proc runStackPush*(): int =
       branchInfo.branches[i].localSha = replay.tip
       branchInfo.branches[i].futureSha = replay.tip
 
+    # Then repair broken parent edges from roots to leaves. A missing local
+    # descendant is materialized from its fetched remote tip before rebasing.
     for depth in 0 .. maxDepth:
       for i in 0 ..< branchInfo.branches.len:
         if not branchInfo.branches[i].stale or
@@ -644,9 +697,12 @@ proc runStackPush*(): int =
         branchInfo.branches[i].futureSha = replay.tip
         branchInfo.branches[i].localSha = replay.tip
 
+    # `checkout` accepts either the saved branch name or a detached commit ID.
     if git(["checkout", "--quiet", restoreTarget], parentStreams = true).status != 0:
       return fail("restacked branches but could not restore the original checkout.")
 
+  # Every ref gets an exact post-fetch lease (empty for a new branch). Atomic
+  # push ensures a later change to one branch prevents all branches from moving.
   var pushArgs = @["push", "--quiet", "--atomic"]
   for branch in branchInfo.branches:
     if doRestack and branch.stale and not branch.pushed:
@@ -661,6 +717,7 @@ proc runStackPush*(): int =
   for update in updates:
     pushArgs.add update.remoteName & ":refs/heads/" & update.remoteName
 
+  # Skip only stack-check in the child push; all unrelated hooks still run.
   let hadSkip = existsEnv("STACK_CHECK_SKIP")
   let oldSkip = getEnv("STACK_CHECK_SKIP")
   putEnv("STACK_CHECK_SKIP", "1")
