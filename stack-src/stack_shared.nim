@@ -115,6 +115,14 @@ proc enumerateBranches(
 ## Infers each branch's nearest historical ancestor as its parent. Two names at
 ## the same commit are equivalent; a pushed name wins that tie, while divergent
 ## equally-near parents are rejected because one linear rebase cannot keep both.
+##
+## Example historical graph (`--` means "is an ancestor of"):
+##
+##   origin/master -- origin/A -- origin/B -- C
+##                                      `--- D
+##
+## B is the parent of both C and D, while A is the parent of B. The configured
+## base wins only when no closer active branch tip exists.
 proc inferParents(branches: var seq[Branch]; baseSha: string): bool =
   for i in 0 ..< branches.len:
     var bestDistance = int.high
@@ -161,6 +169,12 @@ proc inferParents(branches: var seq[Branch]; baseSha: string): bool =
             " on different commits."
           )
           return false
+
+        # Aliases at one commit are harmless until both move differently:
+        #
+        #   A0 (origin/A, origin/A-alias) -- B
+        #        | push A -> A1
+        #        ` push A-alias -> A2       A1 != A2, so B has no single parent.
         if branches[j].pushed and not branches[current].pushed:
           branches[i].parent = j
         elif branches[j].pushed and branches[current].pushed and
@@ -175,6 +189,15 @@ proc inferParents(branches: var seq[Branch]; baseSha: string): bool =
 
 ## Compares historical parent edges with proposed tips, then propagates drift
 ## from stale parents to descendants in depth order.
+##
+## Rewriting A makes B stale directly; C and D become stale by propagation:
+##
+##   history:  origin/master -- A0(origin/A) -- B0(origin/B) -- C
+##                                                   `---------- D
+##   proposed: origin/master -- A1(A)
+##
+## A1 is not an ancestor of B0. Deleting A has the same effect: B loses its
+## parent entirely, and every surviving descendant must be repaired.
 proc markStaleBranches(branches: var seq[Branch]): int =
   for i in 0 ..< branches.len:
     var cursor = branches[i].parent
@@ -467,6 +490,13 @@ proc runStackPush*(): int =
   # A newly fetched tip may already be in the local history. Otherwise, local
   # commits based on the starting tip must be replayed; unrelated divergence is
   # rejected even when --force was supplied.
+  #
+  #   command start: A0(origin/A) -- L(local A)
+  #   after fetch:   A0 ---------- R(origin/A)
+  #   repaired:      A0 -- R -- L'(local A)
+  #
+  # Only commits in A0..L are replayed. If the remote branch appeared from
+  # nothing, disappeared, or no longer shares A0, the safe action is to abort.
   var syncCount = 0
   for i in 0 ..< updates.len:
     let startIndex = initial.tips.findTip(updates[i].remoteName)
@@ -510,6 +540,13 @@ proc runStackPush*(): int =
 
   # Protect omitted stale descendants before adding them to the operation. A
   # local branch may contain unpublished work, but cannot replace fetched work.
+  #
+  #   remote:   master -- A0 -- B0
+  #   proposed: master -- A1          (only A was requested)
+  #
+  # If local B is missing, it is later created at B0 and rebased onto A1. If it
+  # exists, its unpublished commits are retained only when they also retain all
+  # fetched remote commits.
   for i in 0 ..< branchInfo.branches.len:
     if not branchInfo.branches[i].stale or branchInfo.branches[i].pushed:
       continue
@@ -673,7 +710,23 @@ proc runStackPush*(): int =
           parentName =
             if parent >= 0: branchInfo.branches[parent].name
             else: base
+
+        # An omitted child may already be correctly restacked locally:
+        #
+        #   remote: master -- A0 -- B0
+        #   local:  master -- A1 -- B1
+        #
+        # When pushing A1, B1 needs to join the atomic push but not be rebased.
         var alreadyStacked = isAncestor(parentSha, branchInfo.branches[i].localSha)
+
+        # A merge can contain both the rewritten parent and its obsolete
+        # history:
+        #
+        #   master -- A0 -- B0 --.
+        #        `-- A1 ---------+-- local B
+        #
+        # A1 is technically an ancestor, but leaving A0 in B would preserve the
+        # broken stack. Force a replay when both histories are still present.
         if alreadyStacked and parent >= 0 and
             not isAncestor(branchInfo.branches[parent].historySha, parentSha) and
             isAncestor(branchInfo.branches[parent].historySha,
@@ -703,6 +756,10 @@ proc runStackPush*(): int =
 
   # Every ref gets an exact post-fetch lease (empty for a new branch). Atomic
   # push ensures a later change to one branch prevents all branches from moving.
+  #
+  #   leases calculated: A=A1, B=B1
+  #   remote races:      A moves to A2
+  #   result:            reject both A and B; atomicity leaves B at B1
   var pushArgs = @["push", "--quiet", "--atomic"]
   for branch in branchInfo.branches:
     if doRestack and branch.stale and not branch.pushed:
