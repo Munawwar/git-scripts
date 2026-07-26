@@ -1,3 +1,3 @@
 import stack_shared
 
-quit runStackPush()
+runCommand(runStackPush)

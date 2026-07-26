@@ -1,3 +1,3 @@
 import stack_shared
 
-quit runStackCheck()
+runCommand(runStackCheck)

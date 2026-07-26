@@ -1,7 +1,6 @@
 import std/[os, osproc, posix, streams, strutils]
 
 const
-  ZeroOid = "0000000000000000000000000000000000000000"
   DefaultReleases = "dev test release master main"
   NoTtyError = "push would unstack branches; aborting because no interactive terminal is available."
 
@@ -13,7 +12,7 @@ type
     name, historySha, remoteSha, futureSha, localSha: string
     parent: int
     depth: int
-    pushed, deleted, stale, needsSync: bool
+    pushed, deleted, stale, needsSync, alreadyStacked: bool
 
   ## One destination branch and object ID proposed by Git or stack-push.
   Update = object
@@ -25,6 +24,8 @@ type
     name, sha: string
 
   CommandResult = tuple[output: string, status: int]
+  ReplayResult = tuple[tip: string, ok, changed: bool]
+  GitQueryError = object of CatchableError
 
 ## Runs Git without a shell, so branch and remote names remain literal
 ## arguments. Commands that may invoke hooks or show rebase progress inherit
@@ -41,7 +42,8 @@ proc git(args: openArray[string]; parentStreams = false): CommandResult =
     else:
       result.output = process.outputStream.readAll()
       result.status = process.waitForExit()
-  except OSError:
+  except OSError as error:
+    result.output = error.msg
     result.status = 127
 
 proc fail(message: string): int =
@@ -60,9 +62,35 @@ proc findBranch(branches: openArray[Branch]; name: string): int =
       return i
   -1
 
+proc isZeroOid(oid: string): bool =
+  oid.len in [40, 64] and oid.allCharsInSet({'0'})
+
 proc isAncestor(ancestor, descendant: string): bool =
-  ancestor.len > 0 and descendant.len > 0 and
-    git(["merge-base", "--is-ancestor", ancestor, descendant]).status == 0
+  if ancestor.len == 0 or descendant.len == 0 or
+      ancestor.isZeroOid or descendant.isZeroOid:
+    return false
+  let response = git(["merge-base", "--is-ancestor", ancestor, descendant])
+  if response.status in [0, 1]:
+    return response.status == 0
+  var message = "Git could not compare ancestry between " &
+    ancestor[0 ..< min(7, ancestor.len)] & " and " &
+    descendant[0 ..< min(7, descendant.len)]
+  if response.output.strip().len > 0:
+    message.add ": " & response.output.strip()
+  raise newException(GitQueryError, message)
+
+proc isAlreadyStacked(branches: openArray[Branch]; index: int;
+    baseSha: string): bool =
+  let
+    branch = branches[index]
+    parentSha =
+      if branch.parent >= 0: branches[branch.parent].futureSha
+      else: baseSha
+  result = isAncestor(parentSha, branch.localSha)
+  if result and branch.parent >= 0 and
+      not isAncestor(branches[branch.parent].historySha, parentSha) and
+      isAncestor(branches[branch.parent].historySha, branch.localSha):
+    result = false
 
 ## Captures the lease boundary and historical graph before a fetch can move
 ## remote-tracking refs.
@@ -131,7 +159,8 @@ proc inferParents(branches: var seq[Branch]; baseSha: string): bool =
         baseSha & ".." & branches[i].historySha
       ])
       if response.status != 0:
-        stderr.writeLine("Error: could not measure ancestry from the configured base.")
+        stderr.writeLine("Error: could not measure ancestry from the configured base to " &
+          branches[i].name & ".")
         return false
       try:
         bestDistance = response.output.strip().parseInt()
@@ -147,7 +176,8 @@ proc inferParents(branches: var seq[Branch]; baseSha: string): bool =
         branches[j].historySha & ".." & branches[i].historySha
       ])
       if response.status != 0:
-        stderr.writeLine("Error: could not measure ancestry between stack branches.")
+        stderr.writeLine("Error: could not measure ancestry from " & branches[j].name &
+          " to " & branches[i].name & ".")
         return false
       var distance: int
       try:
@@ -234,11 +264,11 @@ proc applyUpdates(
     let index = branches.findBranch(update.remoteName)
     if index >= 0:
       branches[index].pushed = true
-      branches[index].deleted = update.localSha == ZeroOid
+      branches[index].deleted = update.localSha.isZeroOid
       branches[index].futureSha = update.localSha
       if includeLocalSha:
         branches[index].localSha = update.localSha
-    elif update.localSha != ZeroOid and update.remoteName notin excluded and
+    elif not update.localSha.isZeroOid and update.remoteName notin excluded and
         not isAncestor(update.localSha, baseSha):
       branches.add Branch(
         name: update.remoteName,
@@ -253,13 +283,18 @@ proc applyUpdates(
 ## refspecs and shallow clones would otherwise make ancestry checks incomplete.
 proc fetchRemote(remote: string; doFetch: bool): bool =
   if git(["remote", "get-url", remote]).status != 0:
-    stderr.writeLine("Error: the push remote must be a configured Git remote.")
+    stderr.writeLine("Error: " & remote & " is not a configured Git remote.")
     return false
   if not doFetch:
+    stderr.writeLine("Skipping fetch; using existing branches from " & remote & ".")
     return true
+  stderr.writeLine("Fetching branches from " & remote & "...")
   var args = @["fetch", "--quiet", "--prune"]
   let shallow = git(["rev-parse", "--is-shallow-repository"])
-  if shallow.status == 0 and shallow.output.strip() == "true":
+  if shallow.status != 0:
+    stderr.writeLine("Error: could not determine whether the repository is shallow.")
+    return false
+  if shallow.output.strip() == "true":
     args.add "--unshallow"
   args.add remote
   args.add "+refs/heads/*:refs/remotes/" & remote & "/*"
@@ -301,7 +336,8 @@ proc resolveBase(
       break
   if result.name.len == 0:
     if requestedBase.len > 0:
-      stderr.writeLine("Error: the configured base branch has no remote-tracking ref.")
+      stderr.writeLine("Error: configured base " & remote & "/" & requestedBase &
+        " has no remote-tracking ref.")
     else:
       stderr.writeLine("Error: could not infer the remote base; use --base=BRANCH.")
     return
@@ -329,29 +365,55 @@ proc prompt(message: string; choices: openArray[string]):
   except IOError:
     discard
 
+proc recordChange(branches: var seq[string]; name: string) =
+  if name notin branches:
+    branches.add name
+
+proc warnLocalChanges(branches: openArray[string]; remoteState: string) =
+  if branches.len > 0:
+    stderr.writeLine("Warning: local changes remain on " & branches.join(", ") &
+      ". " & remoteState & " Use the recovery tips printed above if needed.")
+
 ## Replays only commits after `oldBase` onto `newBase`. On failure, aborting the
 ## current rebase and restoring the original checkout are attempted separately
 ## so the user gets an accurate recovery state.
 proc replayCommits(
   name, newBase, oldBase, restore: string
-): tuple[tip: string, ok: bool] =
+): ReplayResult =
   if git(["rebase", "--onto", newBase, oldBase, name], parentStreams = true).status != 0:
     let abortOk = git(["rebase", "--abort"]).status == 0
     let restoreOk = git(["checkout", "--quiet", restore], parentStreams = true).status == 0
+    result.changed = not abortOk
     if not abortOk and not restoreOk:
-      stderr.writeLine("Error: rebase failed; neither its automatic abort nor the original checkout restoration succeeded.")
+      stderr.writeLine("Error: rebase of " & name &
+        " failed; neither its automatic abort nor checkout restoration succeeded.")
     elif not abortOk:
-      stderr.writeLine("Error: rebase failed; its automatic abort failed, but the original checkout was restored.")
+      stderr.writeLine("Error: rebase of " & name &
+        " failed; its automatic abort failed, but the original checkout was restored.")
     elif not restoreOk:
-      stderr.writeLine("Error: rebase was aborted, but the original checkout could not be restored.")
+      stderr.writeLine("Error: rebase of " & name &
+        " was aborted, but the original checkout could not be restored.")
     else:
-      stderr.writeLine("Error: rebase failed; it was aborted and the original checkout was restored.")
+      stderr.writeLine("Error: rebase of " & name &
+        " failed; it was aborted and the original checkout was restored.")
     return
   let response = git(["rev-parse", "refs/heads/" & name])
   if response.status != 0:
-    stderr.writeLine("Error: could not resolve a branch after rebasing it.")
+    result.changed = true
+    let restored = git(["checkout", "--quiet", restore], parentStreams = true).status == 0
+    stderr.writeLine("Error: rebased " & name & " but could not resolve its new tip; " &
+      (if restored: "the original checkout was restored."
+       else: "the original checkout could not be restored."))
     return
-  result = (response.output.strip(), true)
+  result = (response.output.strip(), true, true)
+
+proc acceptReplay(changedBranches: var seq[string]; name: string;
+    replay: ReplayResult): bool =
+  if replay.changed:
+    changedBranches.recordChange(name)
+  if not replay.ok:
+    warnLocalChanges(changedBranches, "The remote push has not started.")
+  replay.ok
 
 proc runStackCheck*(): int =
   if existsEnv("STACK_CHECK_SKIP"):
@@ -394,15 +456,27 @@ proc runStackCheck*(): int =
   if posix.isatty(stdin.getFileHandle().cint) != 0:
     return fail("stack-check expects Git pre-push records on stdin; use --help for usage.")
 
-  var updates: seq[Update]
+  var
+    updates: seq[Update]
+    lineNumber = 0
   for line in stdin.lines:
+    inc lineNumber
     let fields = line.splitWhitespace()
-    if fields.len >= 3 and fields[2].startsWith("refs/heads/"):
-      updates.add Update(
-        localSha: fields[1],
-        remoteName: fields[2][11 .. ^1]
-      )
+    if fields.len != 4:
+      return fail("received a malformed pre-push record on line " & $lineNumber & ".")
+    if not fields[2].startsWith("refs/heads/"):
+      continue
+    let branchName = fields[2][11 .. ^1]
+    if branchName.len == 0:
+      return fail("received an empty destination branch on pre-push line " &
+        $lineNumber & ".")
+    if not fields[1].isZeroOid and
+        git(["cat-file", "-e", fields[1] & "^{commit}"]).status != 0:
+      return fail("the proposed tip for " & branchName &
+        " is not an available commit.")
+    updates.add Update(localSha: fields[1], remoteName: branchName)
   if updates.len == 0:
+    stderr.writeLine("No branch updates to check.")
     return 0
 
   # Snapshot first: fetching may move refs and must not rewrite the historical
@@ -415,6 +489,8 @@ proc runStackCheck*(): int =
   let baseInfo = resolveBase(remote, base, initial.tips)
   if not baseInfo.ok:
     return 1
+  stderr.writeLine("Checking branch stack against " & remote & "/" &
+    baseInfo.name & "...")
   var branchInfo = enumerateBranches(remote, baseInfo.baseSha, releases, initial.tips)
   if not branchInfo.ok:
     return fail("could not enumerate remote branches.")
@@ -440,7 +516,7 @@ proc runStackCheck*(): int =
       stderr.writeLine("• " & branch.name & " must be restacked onto " &
         parentName & pushNote)
   if staleCount == 0:
-    stderr.writeLine("Stack check passed.")
+    stderr.writeLine("No branches need restacking.")
     return 0
 
   let response = prompt(
@@ -450,6 +526,8 @@ proc runStackCheck*(): int =
   if not response.available:
     return fail(NoTtyError)
   if response.answer.startsWith("p"):
+    stderr.writeLine("Warning: continuing the push without restacking " &
+      $staleCount & " branch(es).")
     return 0
   fail("push aborted.")
 
@@ -507,9 +585,12 @@ proc runStackPush*(): int =
 
   var updates: seq[Update]
   for i in targetStart ..< targets.len:
+    for update in updates:
+      if update.remoteName == targets[i]:
+        return fail("local branch " & targets[i] & " was requested more than once.")
     let response = git(["rev-parse", "--verify", "refs/heads/" & targets[i]])
     if response.status != 0:
-      return fail("a requested local branch could not be resolved.")
+      return fail("requested local branch " & targets[i] & " could not be resolved.")
     updates.add Update(localSha: response.output.strip(), remoteName: targets[i])
 
   # Keep snapshots from both sides of the fetch. Their difference distinguishes
@@ -566,6 +647,8 @@ proc runStackPush*(): int =
   let baseInfo = resolveBase(remote, base, initial.tips)
   if not baseInfo.ok:
     return 1
+  stderr.writeLine("Checking branch stack against " & remote & "/" &
+    baseInfo.name & "...")
   var branchInfo = enumerateBranches(remote, baseInfo.baseSha, releases, initial.tips)
   if not branchInfo.ok:
     return fail("could not enumerate remote branches.")
@@ -614,13 +697,25 @@ proc runStackPush*(): int =
         " would remove commits from " & remote & "/" & branchInfo.branches[i].name &
         "; rerun with --force if intentional.")
 
+  # An omitted branch that already contains its proposed parent only needs to
+  # join the atomic push. Resolve these from roots to leaves so a complete local
+  # A1 -> B1 -> C1 stack remains silent while replacing remote A0 -> B0 -> C0.
+  for depth in 0 .. maxDepth:
+    for i in 0 ..< branchInfo.branches.len:
+      if branchInfo.branches[i].stale and
+          branchInfo.branches[i].depth == depth and
+          not branchInfo.branches[i].needsSync and
+          isAlreadyStacked(branchInfo.branches, i, baseInfo.baseSha):
+        branchInfo.branches[i].alreadyStacked = true
+        branchInfo.branches[i].futureSha = branchInfo.branches[i].localSha
+
   # Summarize all required local changes before asking for one decision.
   for update in updates:
     if update.needsSync:
       stderr.writeLine("• " & update.remoteName &
         " received remote commits during fetch; local commits must be replayed onto " &
         remote & "/" & update.remoteName)
-  var staleCount = 0
+  var staleCount, restackCount = 0
   for branch in branchInfo.branches:
     if branch.needsSync:
       stderr.writeLine("• " & branch.name &
@@ -628,6 +723,9 @@ proc runStackPush*(): int =
         remote & "/" & branch.name)
     if branch.stale:
       inc staleCount
+      if branch.alreadyStacked:
+        continue
+      inc restackCount
       let parentName =
         if branch.parent >= 0: branchInfo.branches[branch.parent].name
         else: baseInfo.name
@@ -637,16 +735,18 @@ proc runStackPush*(): int =
       stderr.writeLine("• " & branch.name & " must be restacked onto " &
         parentName & pushNote)
 
-  let workCount = staleCount + syncCount
-  var doRestack = workCount > 0
+  let localWorkCount = restackCount + syncCount
+  if localWorkCount == 0:
+    stderr.writeLine("No branches need restacking.")
+  var doRestack = staleCount > 0 or syncCount > 0
   var answer = if autoYes: "r" else: ""
-  if workCount > 0 and not autoYes:
+  if localWorkCount > 0 and not autoYes:
     var choices = @["[r] restack and push every affected branch"]
     if syncCount == 0:
       choices.add "[p] push anyway, leaving the stack broken"
     choices.add "[a] abort (default)"
     let response = prompt(
-      "Stack push requires " & $workCount & " local update(s).",
+      "Stack push requires " & $localWorkCount & " local update(s).",
       choices
     )
     if not response.available:
@@ -654,10 +754,11 @@ proc runStackPush*(): int =
     answer = response.answer
   if answer.startsWith("p") and syncCount == 0:
     doRestack = false
-  elif workCount > 0 and not answer.startsWith("r"):
+  elif localWorkCount > 0 and not answer.startsWith("r"):
     return fail("push aborted.")
 
-  if doRestack:
+  var changedBranches: seq[string]
+  if doRestack and localWorkCount > 0:
     # No branch is touched until the worktree is clean and the original branch
     # name or detached commit has been captured for restoration.
     let status = git(["status", "--porcelain", "--untracked-files=normal"])
@@ -678,7 +779,7 @@ proc runStackPush*(): int =
       if update.needsSync:
         stderr.writeLine("  " & update.remoteName & " [" & update.localSha[0 ..< 7] & "]")
     for branch in branchInfo.branches:
-      if not branch.stale:
+      if not branch.stale or branch.alreadyStacked:
         continue
       var alreadyPrinted = false
       for update in updates:
@@ -700,7 +801,7 @@ proc runStackPush*(): int =
         updates[i].remoteName, updates[i].fetchedRemoteSha,
         updates[i].syncBaseSha, restoreTarget
       )
-      if not replay.ok:
+      if not changedBranches.acceptReplay(updates[i].remoteName, replay):
         return 1
       updates[i].localSha = replay.tip
       let index = branchInfo.branches.findBranch(updates[i].remoteName)
@@ -718,7 +819,7 @@ proc runStackPush*(): int =
         branchInfo.branches[i].name, branchInfo.branches[i].remoteSha,
         branchInfo.branches[i].historySha, restoreTarget
       )
-      if not replay.ok:
+      if not changedBranches.acceptReplay(branchInfo.branches[i].name, replay):
         return 1
       branchInfo.branches[i].localSha = replay.tip
       branchInfo.branches[i].futureSha = replay.tip
@@ -736,8 +837,14 @@ proc runStackPush*(): int =
             remote & "/" & branchInfo.branches[i].name)
           if git(["branch", branchInfo.branches[i].name,
               branchInfo.branches[i].remoteSha], parentStreams = true).status != 0:
-            return fail("could not create a local branch needed for restacking.")
+            warnLocalChanges(changedBranches, "The remote push has not started.")
+            return fail("could not create local branch " &
+              branchInfo.branches[i].name & " for restacking.")
           branchInfo.branches[i].localSha = branchInfo.branches[i].remoteSha
+          changedBranches.recordChange(branchInfo.branches[i].name)
+
+        if branchInfo.branches[i].alreadyStacked:
+          continue
 
         let
           parentSha =
@@ -753,8 +860,6 @@ proc runStackPush*(): int =
         #   local:  master -- A1 -- B1
         #
         # When pushing A1, B1 needs to join the atomic push but not be rebased.
-        var alreadyStacked = isAncestor(parentSha, branchInfo.branches[i].localSha)
-
         # A merge can contain both the rewritten parent and its obsolete
         # history:
         #
@@ -763,14 +868,13 @@ proc runStackPush*(): int =
         #
         # A1 is technically an ancestor, but leaving A0 in B would preserve the
         # broken stack. Force a replay when both histories are still present.
-        if alreadyStacked and parent >= 0 and
-            not isAncestor(branchInfo.branches[parent].historySha, parentSha) and
-            isAncestor(branchInfo.branches[parent].historySha,
-              branchInfo.branches[i].localSha):
-          alreadyStacked = false
+        var alreadyStacked = false
+        try:
+          alreadyStacked = isAlreadyStacked(branchInfo.branches, i, baseInfo.baseSha)
+        except GitQueryError:
+          warnLocalChanges(changedBranches, "The remote push has not started.")
+          raise
         if alreadyStacked:
-          stderr.writeLine(branchInfo.branches[i].name &
-            " ✓ already stacked on " & parentName)
           branchInfo.branches[i].futureSha = branchInfo.branches[i].localSha
           continue
 
@@ -781,13 +885,14 @@ proc runStackPush*(): int =
         let replay = replayCommits(
           branchInfo.branches[i].name, parentSha, oldParent, restoreTarget
         )
-        if not replay.ok:
+        if not changedBranches.acceptReplay(branchInfo.branches[i].name, replay):
           return 1
         branchInfo.branches[i].futureSha = replay.tip
         branchInfo.branches[i].localSha = replay.tip
 
     # `checkout` accepts either the saved branch name or a detached commit ID.
     if git(["checkout", "--quiet", restoreTarget], parentStreams = true).status != 0:
+      warnLocalChanges(changedBranches, "The remote push has not started.")
       return fail("restacked branches but could not restore the original checkout.")
 
   # Every ref gets an exact post-fetch lease (empty for a new branch). Atomic
@@ -796,10 +901,13 @@ proc runStackPush*(): int =
   #   leases calculated: A=A1, B=B1
   #   remote races:      A moves to A2
   #   result:            reject both A and B; atomicity leaves B at B1
-  var pushArgs = @["push", "--quiet", "--atomic"]
+  var
+    pushArgs = @["push", "--quiet", "--atomic"]
+    pushCount = updates.len
   for branch in branchInfo.branches:
     if doRestack and branch.stale and not branch.pushed:
       pushArgs.add "--force-with-lease=refs/heads/" & branch.name & ":" & branch.remoteSha
+      inc pushCount
   for update in updates:
     pushArgs.add "--force-with-lease=refs/heads/" & update.remoteName & ":" &
       update.fetchedRemoteSha
@@ -811,6 +919,7 @@ proc runStackPush*(): int =
     pushArgs.add update.remoteName & ":refs/heads/" & update.remoteName
 
   # Skip only stack-check in the child push; all unrelated hooks still run.
+  stderr.writeLine("Pushing " & $pushCount & " branch(es) to " & remote & "...")
   let hadSkip = existsEnv("STACK_CHECK_SKIP")
   let oldSkip = getEnv("STACK_CHECK_SKIP")
   putEnv("STACK_CHECK_SKIP", "1")
@@ -818,10 +927,22 @@ proc runStackPush*(): int =
   if hadSkip: putEnv("STACK_CHECK_SKIP", oldSkip)
   else: delEnv("STACK_CHECK_SKIP")
   if pushStatus != 0:
-    return fail("the stack push failed.")
+    warnLocalChanges(changedBranches, "The atomic push updated no remote branches.")
+    return fail("the atomic stack push failed; no remote branches were updated.")
   if not doRestack and staleCount > 0:
     stderr.writeLine("Pushed requested branches without restacking.")
+  elif doRestack and localWorkCount > 0:
+    stderr.writeLine("Restacked and pushed all affected branches.")
   else:
-    stderr.writeLine((if doRestack: "Restacked" else: "Checked") &
-      " and pushed all affected branches.")
+    stderr.writeLine("Push completed.")
   0
+
+proc runCommand*(command: proc(): int) =
+  try:
+    quit command()
+  except GitQueryError as error:
+    stderr.writeLine("Error: " & error.msg)
+    quit 1
+  except CatchableError as error:
+    stderr.writeLine("Error: unexpected runtime failure: " & error.msg)
+    quit 1
