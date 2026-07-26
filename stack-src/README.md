@@ -64,7 +64,7 @@ stack-push --force feature-a
 -f, --force                  allow an intentional remote-history rewrite
     --no-fetch               use existing remote-tracking refs
     --remote=NAME            push remote (default: origin)
-    --base=BRANCH            stack base (default: master)
+    --base=BRANCH            stack base (default: remote HEAD)
     --release-branches=LIST  space-separated excluded branches
 ```
 
@@ -88,6 +88,9 @@ list are excluded. For every remaining branch, the nearest branch tip in its
 ancestry is treated as its parent. The proposed push commit IDs are then
 applied to that graph to find children and descendants that require
 restacking.
+
+Without `--base`, the tools use the selected remote's symbolic HEAD, falling
+back to `main` and then `master` when that symbolic ref is unavailable.
 
 Git does not record a declared stack parent. The configured base wins ties.
 Other branch names at the same commit are treated as equivalent, with a branch

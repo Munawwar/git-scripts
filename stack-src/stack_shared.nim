@@ -1,8 +1,7 @@
-import std/[os, osproc, streams, strutils]
+import std/[os, osproc, posix, streams, strutils]
 
 const
   ZeroOid = "0000000000000000000000000000000000000000"
-  DefaultBase = "master"
   DefaultReleases = "dev test release master main"
   NoTtyError = "push would unstack branches; aborting because no interactive terminal is available."
 
@@ -269,19 +268,46 @@ proc fetchRemote(remote: string; doFetch: bool): bool =
     return false
   true
 
-## Resolves the fetched base for future ancestry while retaining its
-## command-start tip for historical parent inference.
+## Resolves an explicit base or tries the remote HEAD, main, then master. The
+## fetched tip drives future ancestry while the command-start tip drives
+## historical parent inference.
 proc resolveBase(
-  remote, base: string;
+  remote, requestedBase: string;
   startingTips: openArray[RemoteTip]
-): tuple[baseSha, historyBaseSha: string, ok: bool] =
-  let response = git(["rev-parse", "--verify", "refs/remotes/" & remote & "/" & base])
-  if response.status != 0:
-    stderr.writeLine("Error: the configured base branch has no remote-tracking ref.")
+): tuple[name, baseSha, historyBaseSha: string, ok: bool] =
+  var candidates: seq[string]
+  if requestedBase.len > 0:
+    candidates.add requestedBase
+  else:
+    let head = git([
+      "symbolic-ref", "--quiet", "--short", "refs/remotes/" & remote & "/HEAD"
+    ])
+    let prefix = remote & "/"
+    let headName = head.output.strip()
+    if head.status == 0 and headName.startsWith(prefix) and
+        headName.len > prefix.len:
+      candidates.add headName[prefix.len .. ^1]
+    for fallback in ["main", "master"]:
+      if fallback notin candidates:
+        candidates.add fallback
+
+  for candidate in candidates:
+    let response = git([
+      "rev-parse", "--verify", "refs/remotes/" & remote & "/" & candidate
+    ])
+    if response.status == 0:
+      result.name = candidate
+      result.baseSha = response.output.strip()
+      break
+  if result.name.len == 0:
+    if requestedBase.len > 0:
+      stderr.writeLine("Error: the configured base branch has no remote-tracking ref.")
+    else:
+      stderr.writeLine("Error: could not infer the remote base; use --base=BRANCH.")
     return
-  result.baseSha = response.output.strip()
+
   result.historyBaseSha = result.baseSha
-  let startingIndex = startingTips.findTip(base)
+  let startingIndex = startingTips.findTip(result.name)
   if startingIndex >= 0:
     result.historyBaseSha = startingTips[startingIndex].sha
   result.ok = true
@@ -336,7 +362,7 @@ proc runStackCheck*(): int =
     remote = "origin"
     remoteExplicit = false
     doFetch = true
-    base = DefaultBase
+    base = ""
     releases = DefaultReleases
     targets: seq[string]
   for arg in commandLineParams():
@@ -350,8 +376,13 @@ proc runStackCheck*(): int =
     elif arg.startsWith("--release-branches="):
       releases = arg[19 .. ^1]
     elif arg in ["-h", "--help"]:
-      echo "Usage: stack-check [remote] [remote-url]"
+      echo "Usage: stack-check [options] [remote] [remote-url]"
       echo "Git pre-push hook; reads ref updates from stdin."
+      echo "      --no-fetch               use existing remote-tracking refs"
+      echo "      --remote=NAME            override the hook remote"
+      echo "      --base=BRANCH            stack base (default: remote HEAD)"
+      echo "      --release-branches=LIST  space-separated excluded branches"
+      echo "  -h, --help                   show this help"
       return 0
     elif arg.startsWith("-"):
       return fail("unknown option; use --help for usage.")
@@ -359,6 +390,8 @@ proc runStackCheck*(): int =
       targets.add arg
   if targets.len > 0 and not remoteExplicit:
     remote = targets[0]
+  if posix.isatty(stdin.getFileHandle().cint) != 0:
+    return fail("stack-check expects Git pre-push records on stdin; use --help for usage.")
 
   var updates: seq[Update]
   for line in stdin.lines:
@@ -399,7 +432,7 @@ proc runStackCheck*(): int =
       inc staleCount
       let parentName =
         if branch.parent >= 0: branchInfo.branches[branch.parent].name
-        else: base
+        else: baseInfo.name
       let pushNote =
         if branch.pushed: " (included in this push)"
         else: " (OMITTED from this push)"
@@ -425,7 +458,7 @@ proc runStackPush*(): int =
     remote = "origin"
     remoteExplicit, autoYes, allowRewrite = false
     doFetch = true
-    base = DefaultBase
+    base = ""
     releases = DefaultReleases
     targets: seq[string]
   for arg in commandLineParams():
@@ -448,8 +481,9 @@ proc runStackPush*(): int =
       echo "  -f, --force                  allow removal of commits present when the command started"
       echo "      --no-fetch               use existing remote-tracking refs"
       echo "      --remote=NAME            push remote (default: origin)"
-      echo "      --base=BRANCH            stack base (default: master)"
+      echo "      --base=BRANCH            stack base (default: remote HEAD)"
       echo "      --release-branches=LIST  space-separated excluded branches"
+      echo "  -h, --help                   show this help"
       return 0
     elif arg.startsWith("-"):
       return fail("unknown option; use --help for usage.")
@@ -594,7 +628,7 @@ proc runStackPush*(): int =
       inc staleCount
       let parentName =
         if branch.parent >= 0: branchInfo.branches[branch.parent].name
-        else: base
+        else: baseInfo.name
       let pushNote =
         if branch.pushed: " (included in this push)"
         else: " (OMITTED from this push)"
@@ -709,7 +743,7 @@ proc runStackPush*(): int =
             else: baseInfo.baseSha
           parentName =
             if parent >= 0: branchInfo.branches[parent].name
-            else: base
+            else: baseInfo.name
 
         # An omitted child may already be correctly restacked locally:
         #
