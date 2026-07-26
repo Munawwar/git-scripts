@@ -1,6 +1,0 @@
-import "./shared.zc"
-
-/// Runs the active workflow that may restack and push corrected branch tips.
-fn main(argc: int, argv: string*) -> int {
-    return run_stack_push(argc, argv);
-}
