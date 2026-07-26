@@ -124,5 +124,5 @@ Source layout:
 - `stack_shared.nim` contains the shared Git and stack-graph logic.
 
 The build uses `--mm:orc` for deterministic automatic memory management and
-`-d:useFork` because Cosmopolitan's `posix_spawn` implementation cannot launch
-the host Git executable through Nim's standard process wrapper.
+`-d:useFork` because Nim's `posix_spawn` path could not launch the host Git
+executable in a Cosmopolitan build.

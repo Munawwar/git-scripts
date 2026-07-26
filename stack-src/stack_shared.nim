@@ -4,8 +4,7 @@ const
   ZeroOid = "0000000000000000000000000000000000000000"
   DefaultBase = "master"
   DefaultReleases = "dev test release master main"
-
-let GitExecutable = findExe("git")
+  NoTtyError = "push would unstack branches; aborting because no interactive terminal is available."
 
 type
   Branch = object
@@ -24,19 +23,17 @@ type
   CommandResult = tuple[output: string, status: int]
 
 proc git(args: openArray[string]; parentStreams = false): CommandResult =
-  if GitExecutable.len == 0:
-    return (output: "", status: 127)
   let options =
     if parentStreams: {poUsePath, poParentStreams}
     else: {poUsePath, poStdErrToStdOut}
   try:
-    let process = startProcess(GitExecutable, args = args, options = options)
+    let process = startProcess("git", args = args, options = options)
+    defer: process.close()
     if parentStreams:
       result.status = process.waitForExit()
     else:
       result.output = process.outputStream.readAll()
       result.status = process.waitForExit()
-    process.close()
   except OSError:
     result.status = 127
 
@@ -243,10 +240,12 @@ proc resolveBase(
     result.historyBaseSha = startingTips[startingIndex].sha
   result.ok = true
 
-proc prompt(message: string; choices: openArray[string]): string =
+proc prompt(message: string; choices: openArray[string]):
+    tuple[answer: string, available: bool] =
   var tty: File
   if not open(tty, "/dev/tty", fmReadWrite):
-    return ""
+    return
+  result.available = true
   defer: tty.close()
   tty.write("\n" & message & "\n")
   for choice in choices:
@@ -254,7 +253,7 @@ proc prompt(message: string; choices: openArray[string]): string =
   tty.write("Choice: ")
   tty.flushFile()
   try:
-    result = tty.readLine().strip().toLowerAscii()
+    result.answer = tty.readLine().strip().toLowerAscii()
   except IOError:
     discard
 
@@ -354,11 +353,13 @@ proc runStackCheck*(): int =
     stderr.writeLine("Stack check passed.")
     return 0
 
-  let answer = prompt(
+  let response = prompt(
     "Push would unstack " & $staleCount & " branch(es).",
     ["[p] continue this push without repairing the stack", "[a] abort (default)"]
   )
-  if answer.startsWith("p"):
+  if not response.available:
+    return fail(NoTtyError)
+  if response.answer.startsWith("p"):
     return 0
   fail("push aborted.")
 
@@ -525,7 +526,13 @@ proc runStackPush*(): int =
     if syncCount == 0:
       choices.add "[p] push anyway, leaving the stack broken"
     choices.add "[a] abort (default)"
-    answer = prompt("Stack push requires " & $workCount & " local update(s).", choices)
+    let response = prompt(
+      "Stack push requires " & $workCount & " local update(s).",
+      choices
+    )
+    if not response.available:
+      return fail(NoTtyError)
+    answer = response.answer
   if answer.startsWith("p") and syncCount == 0:
     doRestack = false
   elif workCount > 0 and not answer.startsWith("r"):
@@ -533,11 +540,15 @@ proc runStackPush*(): int =
 
   if doRestack:
     let status = git(["status", "--porcelain", "--untracked-files=normal"])
+    if status.status != 0:
+      return fail("could not verify that the working tree is clean.")
     if status.output.len > 0:
       return fail("automatic restacking requires a clean working tree.")
     var restore = git(["symbolic-ref", "--quiet", "--short", "HEAD"])
     if restore.status != 0:
       restore = git(["rev-parse", "HEAD"])
+    if restore.status != 0:
+      return fail("could not preserve the current checkout before restacking.")
     let restoreTarget = restore.output.strip()
 
     stderr.writeLine("\nLocal branch tips before restacking:")
