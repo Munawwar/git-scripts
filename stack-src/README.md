@@ -66,6 +66,7 @@ stack-push --force feature-a
     --remote=NAME            push remote (default: origin)
     --base=BRANCH            stack base (default: remote HEAD)
     --release-branches=LIST  space-separated excluded branches
+                            default: dev test release master main
 ```
 
 By default, `stack-push` rejects a local tip that would remove commits already

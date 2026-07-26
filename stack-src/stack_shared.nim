@@ -382,6 +382,7 @@ proc runStackCheck*(): int =
       echo "      --remote=NAME            override the hook remote"
       echo "      --base=BRANCH            stack base (default: remote HEAD)"
       echo "      --release-branches=LIST  space-separated excluded branches"
+      echo "                               default: " & DefaultReleases
       echo "  -h, --help                   show this help"
       return 0
     elif arg.startsWith("-"):
@@ -483,6 +484,7 @@ proc runStackPush*(): int =
       echo "      --remote=NAME            push remote (default: origin)"
       echo "      --base=BRANCH            stack base (default: remote HEAD)"
       echo "      --release-branches=LIST  space-separated excluded branches"
+      echo "                               default: " & DefaultReleases
       echo "  -h, --help                   show this help"
       return 0
     elif arg.startsWith("-"):
