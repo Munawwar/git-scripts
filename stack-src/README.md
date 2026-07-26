@@ -1,6 +1,6 @@
 # stack-check and stack-push
 
-These portable Zen-C executables replace `stacked.js` and `stacked-push.js`:
+These portable Nim executables replace `stacked.js` and `stacked-push.js`:
 
 - `stack-check.com` runs as a Git `pre-push` hook. It checks the exact commit
   IDs Git intends to push, reports branches that would become unstacked, and
@@ -9,8 +9,8 @@ These portable Zen-C executables replace `stacked.js` and `stacked-push.js`:
   descendants, and pushes all corrected tips in one atomic operation.
 
 The executables are Actually Portable Executables and do not require Node.js,
-fnm, or npm dependencies. They are built from separate entry points;
-push/rebase functions are excluded at compile time from `stack-check.com`.
+fnm, or npm dependencies. Nim's ORC memory management reclaims strings,
+sequences, and objects automatically.
 
 ## Install
 
@@ -105,7 +105,7 @@ The final push uses an exact force-with-lease check for every branch and
 ## Build
 
 Prebuilt APE binaries are committed at the repository root. Rebuilding
-requires Zen-C at `.toolchain/Zen-C/zc` and Cosmopolitan at
+requires Nim 2.2 or newer at `.toolchain/nim/bin/nim` and Cosmopolitan at
 `.toolchain/cosmocc/bin/cosmocc`.
 
 From the repository root:
@@ -119,7 +119,10 @@ and `stack-push.com` are copied to the repository root.
 
 Source layout:
 
-- `stack-check.zc` is the check-only entry point.
-- `stack-push.zc` is the active entry point.
-- `shared.zc` contains shared Git and stack-graph logic. Active push/rebase
-  functions in this file are compile-time gated out of the checker build.
+- `stack_check.nim` is the check-only entry point.
+- `stack_push.nim` is the push/restack entry point.
+- `stack_shared.nim` contains the shared Git and stack-graph logic.
+
+The build uses `--mm:orc` for deterministic automatic memory management and
+`-d:useFork` because Cosmopolitan's `posix_spawn` implementation cannot launch
+the host Git executable through Nim's standard process wrapper.
