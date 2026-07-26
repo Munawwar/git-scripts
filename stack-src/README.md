@@ -1,6 +1,6 @@
 # stack-check and stack-push
 
-These portable Zen-C executables replace `stacked.js` and `stacked-push.js`:
+These portable Nim executables replace `stacked.js` and `stacked-push.js`:
 
 - `stack-check.com` runs as a Git `pre-push` hook. It checks the exact commit
   IDs Git intends to push, reports branches that would become unstacked, and
@@ -9,8 +9,8 @@ These portable Zen-C executables replace `stacked.js` and `stacked-push.js`:
   descendants, and pushes all corrected tips in one atomic operation.
 
 The executables are Actually Portable Executables and do not require Node.js,
-fnm, or npm dependencies. They are built from separate entry points;
-push/rebase functions are excluded at compile time from `stack-check.com`.
+fnm, or npm dependencies. Nim's ORC memory management reclaims strings,
+sequences, and objects automatically.
 
 ## Install
 
@@ -64,8 +64,9 @@ stack-push --force feature-a
 -f, --force                  allow an intentional remote-history rewrite
     --no-fetch               use existing remote-tracking refs
     --remote=NAME            push remote (default: origin)
-    --base=BRANCH            stack base (default: master)
+    --base=BRANCH            stack base (default: remote HEAD)
     --release-branches=LIST  space-separated excluded branches
+                            default: dev test release master main
 ```
 
 By default, `stack-push` rejects a local tip that would remove commits already
@@ -89,6 +90,9 @@ ancestry is treated as its parent. The proposed push commit IDs are then
 applied to that graph to find children and descendants that require
 restacking.
 
+Without `--base`, the tools use the selected remote's symbolic HEAD, falling
+back to `main` and then `master` when that symbolic ref is unavailable.
+
 Git does not record a declared stack parent. The configured base wins ties.
 Other branch names at the same commit are treated as equivalent, with a branch
 included in the push preferred as the parent. The operation aborts if
@@ -105,7 +109,7 @@ The final push uses an exact force-with-lease check for every branch and
 ## Build
 
 Prebuilt APE binaries are committed at the repository root. Rebuilding
-requires Zen-C at `.toolchain/Zen-C/zc` and Cosmopolitan at
+requires Nim 2.2 or newer at `.toolchain/nim/bin/nim` and Cosmopolitan at
 `.toolchain/cosmocc/bin/cosmocc`.
 
 From the repository root:
@@ -119,7 +123,10 @@ and `stack-push.com` are copied to the repository root.
 
 Source layout:
 
-- `stack-check.zc` is the check-only entry point.
-- `stack-push.zc` is the active entry point.
-- `shared.zc` contains shared Git and stack-graph logic. Active push/rebase
-  functions in this file are compile-time gated out of the checker build.
+- `stack_check.nim` is the check-only entry point.
+- `stack_push.nim` is the push/restack entry point.
+- `stack_shared.nim` contains the shared Git and stack-graph logic.
+
+The build uses `--mm:orc` for deterministic automatic memory management and
+`-d:useFork` because Nim's `posix_spawn` path could not launch the host Git
+executable in a Cosmopolitan build.
