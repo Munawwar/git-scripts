@@ -34,7 +34,7 @@ new_repo() {
   OUTPUT="$CASE_DIR/output"
   mkdir -p "$CASE_DIR"
   "$REAL_GIT" init --bare -q "$REMOTE"
-  "$REAL_GIT" clone -q "$REMOTE" "$WORK"
+  "$REAL_GIT" clone -q "$REMOTE" "$WORK" 2>/dev/null
   "$REAL_GIT" -C "$WORK" config user.name "Stack Tests"
   "$REAL_GIT" -C "$WORK" config user.email "stack-tests@example.com"
   printf 'base\n' > "$WORK/base"
@@ -550,7 +550,7 @@ REMOTE="$CASE_DIR/remote.git"
 OUTPUT="$CASE_DIR/output"
 mkdir -p "$CASE_DIR"
 "$REAL_GIT" init --bare --object-format=sha256 -q "$REMOTE"
-"$REAL_GIT" clone -q "$REMOTE" "$WORK"
+"$REAL_GIT" clone -q "$REMOTE" "$WORK" 2>/dev/null
 "$REAL_GIT" -C "$WORK" config user.name "Stack Tests"
 "$REAL_GIT" -C "$WORK" config user.email "stack-tests@example.com"
 printf 'base\n' > "$WORK/base"
@@ -568,6 +568,7 @@ check_output "No branches need restacking."
 remote_a=$("$REAL_GIT" -C "$WORK" rev-parse origin/feature-a)
 zero64=0000000000000000000000000000000000000000000000000000000000000000
 run_check "(delete) $zero64 refs/heads/feature-a $remote_a" --no-fetch origin
+check_status 0
 check_no_output "not an available commit"
 check_no_output "could not compare ancestry"
 

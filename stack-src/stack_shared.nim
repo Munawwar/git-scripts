@@ -12,7 +12,7 @@ type
     name, historySha, remoteSha, futureSha, localSha: string
     parent: int
     depth: int
-    pushed, deleted, stale, needsSync, alreadyStacked: bool
+    pushed, deleted, stale, needsSync, needsRestack: bool
 
   ## One destination branch and object ID proposed by Git or stack-push.
   Update = object
@@ -79,17 +79,17 @@ proc isAncestor(ancestor, descendant: string): bool =
     message.add ": " & response.output.strip()
   raise newException(GitQueryError, message)
 
-proc isAlreadyStacked(branches: openArray[Branch]; index: int;
-    baseSha: string): bool =
+proc isStackedOnParent(branches: openArray[Branch]; index: int;
+    baseSha, branchSha: string): bool =
   let
     branch = branches[index]
     parentSha =
       if branch.parent >= 0: branches[branch.parent].futureSha
       else: baseSha
-  result = isAncestor(parentSha, branch.localSha)
+  result = isAncestor(parentSha, branchSha)
   if result and branch.parent >= 0 and
       not isAncestor(branches[branch.parent].historySha, parentSha) and
-      isAncestor(branches[branch.parent].historySha, branch.localSha):
+      isAncestor(branches[branch.parent].historySha, branchSha):
     result = false
 
 ## Captures the lease boundary and historical graph before a fetch can move
@@ -268,6 +268,7 @@ proc applyUpdates(
       branches[index].futureSha = update.localSha
       if includeLocalSha:
         branches[index].localSha = update.localSha
+        branches[index].needsSync = update.needsSync
     elif not update.localSha.isZeroOid and update.remoteName notin excluded and
         not isAncestor(update.localSha, baseSha):
       branches.add Branch(
@@ -697,17 +698,28 @@ proc runStackPush*(): int =
         " would remove commits from " & remote & "/" & branchInfo.branches[i].name &
         "; rerun with --force if intentional.")
 
-  # An omitted branch that already contains its proposed parent only needs to
-  # join the atomic push. Resolve these from roots to leaves so a complete local
-  # A1 -> B1 -> C1 stack remains silent while replacing remote A0 -> B0 -> C0.
+  # Plan from roots to leaves. A branch is stable only when its parent's final
+  # tip is already known and present in its local history. If the parent still
+  # needs syncing or restacking, its final commit does not exist yet, so every
+  # stale child must be reconsidered after that parent finishes.
+  #
+  #   known:   A1 -> local B1 -> local C1       B and C can stay unchanged
+  #   unknown: A1 -> B0 -> C0, with B pending  C must follow the eventual B1
   for depth in 0 .. maxDepth:
     for i in 0 ..< branchInfo.branches.len:
-      if branchInfo.branches[i].stale and
-          branchInfo.branches[i].depth == depth and
-          not branchInfo.branches[i].needsSync and
-          isAlreadyStacked(branchInfo.branches, i, baseInfo.baseSha):
-        branchInfo.branches[i].alreadyStacked = true
+      if not branchInfo.branches[i].stale or
+          branchInfo.branches[i].depth != depth:
+        continue
+      let parent = branchInfo.branches[i].parent
+      let parentFinalKnown = parent < 0 or
+        (not branchInfo.branches[parent].needsSync and
+         not branchInfo.branches[parent].needsRestack)
+      if parentFinalKnown and not branchInfo.branches[i].needsSync and
+          isStackedOnParent(branchInfo.branches, i, baseInfo.baseSha,
+            branchInfo.branches[i].localSha):
         branchInfo.branches[i].futureSha = branchInfo.branches[i].localSha
+      else:
+        branchInfo.branches[i].needsRestack = true
 
   # Summarize all required local changes before asking for one decision.
   for update in updates:
@@ -717,13 +729,13 @@ proc runStackPush*(): int =
         remote & "/" & update.remoteName)
   var staleCount, restackCount = 0
   for branch in branchInfo.branches:
-    if branch.needsSync:
+    if branch.needsSync and not branch.pushed:
       stderr.writeLine("• " & branch.name &
         " received remote commits during fetch; local commits must be replayed onto " &
         remote & "/" & branch.name)
     if branch.stale:
       inc staleCount
-      if branch.alreadyStacked:
+      if not branch.needsRestack:
         continue
       inc restackCount
       let parentName =
@@ -779,7 +791,7 @@ proc runStackPush*(): int =
       if update.needsSync:
         stderr.writeLine("  " & update.remoteName & " [" & update.localSha[0 ..< 7] & "]")
     for branch in branchInfo.branches:
-      if not branch.stale or branch.alreadyStacked:
+      if not branch.stale or not branch.needsRestack:
         continue
       var alreadyPrinted = false
       for update in updates:
@@ -810,7 +822,7 @@ proc runStackPush*(): int =
         branchInfo.branches[index].localSha = replay.tip
 
     for i in 0 ..< branchInfo.branches.len:
-      if not branchInfo.branches[i].needsSync:
+      if not branchInfo.branches[i].needsSync or branchInfo.branches[i].pushed:
         continue
       stderr.writeLine(branchInfo.branches[i].name &
         " → replaying local commits onto updated " & remote & "/" &
@@ -843,7 +855,7 @@ proc runStackPush*(): int =
           branchInfo.branches[i].localSha = branchInfo.branches[i].remoteSha
           changedBranches.recordChange(branchInfo.branches[i].name)
 
-        if branchInfo.branches[i].alreadyStacked:
+        if not branchInfo.branches[i].needsRestack:
           continue
 
         let
@@ -870,7 +882,8 @@ proc runStackPush*(): int =
         # broken stack. Force a replay when both histories are still present.
         var alreadyStacked = false
         try:
-          alreadyStacked = isAlreadyStacked(branchInfo.branches, i, baseInfo.baseSha)
+          alreadyStacked = isStackedOnParent(branchInfo.branches, i,
+            baseInfo.baseSha, branchInfo.branches[i].localSha)
         except GitQueryError:
           warnLocalChanges(changedBranches, "The remote push has not started.")
           raise
@@ -894,6 +907,27 @@ proc runStackPush*(): int =
     if git(["checkout", "--quiet", restoreTarget], parentStreams = true).status != 0:
       warnLocalChanges(changedBranches, "The remote push has not started.")
       return fail("restacked branches but could not restore the original checkout.")
+
+  # Never trust the plan alone. Verify the realized parent edge for every
+  # surviving stack branch after all commit IDs are final and before any push.
+  if doRestack:
+    stderr.writeLine("Validating final branch stack...")
+    for i in 0 ..< branchInfo.branches.len:
+      let parent = branchInfo.branches[i].parent
+      if branchInfo.branches[i].deleted or parent < 0:
+        continue
+      var valid = false
+      try:
+        valid = isStackedOnParent(branchInfo.branches, i, baseInfo.baseSha,
+          branchInfo.branches[i].futureSha)
+      except GitQueryError:
+        warnLocalChanges(changedBranches, "The remote push has not started.")
+        raise
+      if not valid:
+        warnLocalChanges(changedBranches, "The remote push has not started.")
+        return fail("final stack validation failed: " &
+          branchInfo.branches[i].name & " is not stacked on " &
+          branchInfo.branches[parent].name & ".")
 
   # Every ref gets an exact post-fetch lease (empty for a new branch). Atomic
   # push ensures a later change to one branch prevents all branches from moving.
@@ -927,8 +961,9 @@ proc runStackPush*(): int =
   if hadSkip: putEnv("STACK_CHECK_SKIP", oldSkip)
   else: delEnv("STACK_CHECK_SKIP")
   if pushStatus != 0:
-    warnLocalChanges(changedBranches, "The atomic push updated no remote branches.")
-    return fail("the atomic stack push failed; no remote branches were updated.")
+    warnLocalChanges(changedBranches, "The remote outcome is unknown.")
+    return fail("the atomic stack push failed; the remote outcome is unknown. " &
+      "Fetch " & remote & " before retrying.")
   if not doRestack and staleCount > 0:
     stderr.writeLine("Pushed requested branches without restacking.")
   elif doRestack and localWorkCount > 0:

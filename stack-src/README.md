@@ -116,10 +116,14 @@ From the repository root:
 
 ```sh
 make -C stack-src
+make -C stack-src test
 ```
 
 Build intermediates remain under `stack-src/build/`; only `stack-check.com`
 and `stack-push.com` are copied to the repository root.
+
+The integration suite creates disposable local Git remotes and covers stack
+planning, fetch races, recovery failures, atomic pushes, and SHA-256 object IDs.
 
 Source layout:
 
