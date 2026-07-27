@@ -5,9 +5,12 @@ ROOT_DIR := ..
 NIMFLAGS := --cc:env -d:release -d:useMalloc -d:useFork --mm:orc \
 	--passC:-Wno-discarded-qualifiers
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: $(ROOT_DIR)/stack-check.com $(ROOT_DIR)/stack-push.com
+
+test: all
+	bash tests/run.sh
 
 $(BUILD_DIR):
 	mkdir -p $@
