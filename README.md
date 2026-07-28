@@ -75,6 +75,22 @@ long running branch means e.g a branch that touches 100s of files that is taking
 
 After deploying from release branch, this script traverses through all git repos and creates a "backup" branch from master's commit and merges the release branch to master. 
 
+# prune-merged-branches.sh
+
+Lists remote branches older than two months whose tips are already merged into
+`origin/master`. It is a dry run unless deletion is explicitly enabled:
+
+```sh
+prune-merged-branches.sh
+prune-merged-branches.sh --dry-run=false
+```
+
+Branches are deleted in atomic batches of 50 with exact leases. A failed batch
+is retried one branch at a time, so a branch that moved after the scan is
+skipped and reported without blocking the others. The branches `dev`, `test`,
+`release`, `master`, `main`, every `backup*` branch, and the selected base are
+always protected.
+
 # stack-check and stack-push
 
 - `stack-check.com` is a `pre-push` hook that warns when a push would break a
