@@ -156,6 +156,7 @@ check_output "--remote=NAME"
 check_output "--base=BRANCH"
 check_output "--release-branches=LIST"
 check_output "default: dev test release master main"
+check_output "Active remote branches: last 2 months"
 if timeout 3 script -qfec "$STACK_CHECK" /dev/null >"$OUTPUT" 2>&1; then
   LAST_STATUS=0
 else
@@ -272,6 +273,23 @@ check_status 0
 check_output "feature-b must be restacked onto feature-a"
 check_output "feature-b → rebasing onto feature-a"
 check_ancestor feature-a feature-b "omitted child restack"
+
+start_case "old requested parent retains its recent descendant"
+new_repo
+"$REAL_GIT" -C "$WORK" checkout -qb feature-a
+old_date=$(date --date='4 months ago' --iso-8601=seconds)
+GIT_AUTHOR_DATE=$old_date GIT_COMMITTER_DATE=$old_date commit_file a a0 A0
+push_branch feature-a
+"$REAL_GIT" -C "$WORK" checkout -qb feature-b
+commit_file b b0 B0
+push_branch feature-b
+"$REAL_GIT" -C "$WORK" checkout -q feature-a
+"$REAL_GIT" -C "$WORK" reset -q --hard master
+commit_file a a1 A1
+run_push -y -f --no-fetch feature-a
+check_status 0
+check_output "feature-b → rebasing onto feature-a"
+check_ancestor feature-a feature-b "recent child of old requested parent"
 
 start_case "already-restacked omitted child stays silent but is pushed"
 new_repo

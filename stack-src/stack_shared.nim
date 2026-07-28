@@ -1,6 +1,7 @@
 import std/[os, osproc, posix, streams, strutils]
 
 const
+  ActiveBranchMonths = 2
   DefaultReleases = "dev test release master main"
   NoTtyError = "push would unstack branches; aborting because no interactive terminal is available."
 
@@ -108,26 +109,52 @@ proc loadRemoteTips(remote: string): tuple[tips: seq[RemoteTip], ok: bool] =
     if fields.len >= 2 and fields[0] != "HEAD":
       result.tips.add RemoteTip(name: fields[0], sha: fields[1])
 
-## Enumerates open stack branches after fetching. Branches already merged into
-## the base and configured release branches do not participate in restacking.
+## Enumerates recently active open stack branches after fetching. Explicitly
+## requested branches bypass the activity cutoff so their historical tips and
+## relationships remain available. Merged and release branches are excluded.
 proc enumerateBranches(
   remote, baseSha, releases: string;
-  startingTips: openArray[RemoteTip]
+  startingTips: openArray[RemoteTip];
+  updates: openArray[Update]
 ): tuple[branches: seq[Branch], ok: bool] =
-  let response = git([
-    "for-each-ref",
-    "--format=%(refname:strip=3) %(objectname)",
-    "--no-merged=" & baseSha,
-    "refs/remotes/" & remote
-  ])
-  if response.status != 0:
+  let
+    cutoffResponse = git([
+      "rev-parse", "--since=" & $ActiveBranchMonths & " months ago"
+    ])
+    response = git([
+      "for-each-ref",
+      "--format=%(refname:strip=3) %(objectname) %(committerdate:unix)",
+      "--no-merged=" & baseSha,
+      "refs/remotes/" & remote
+    ])
+  if cutoffResponse.status != 0 or response.status != 0:
+    return
+  let cutoffFields = cutoffResponse.output.strip().split("=")
+  var cutoffEpoch: BiggestInt
+  try:
+    cutoffEpoch = cutoffFields[^1].parseBiggestInt()
+  except ValueError, IndexDefect:
+    stderr.writeLine("Error: Git returned an invalid branch activity cutoff.")
     return
   result.ok = true
   let excluded = releases.splitWhitespace()
   for line in response.output.splitLines():
     let fields = line.splitWhitespace()
-    if fields.len < 2 or fields[0] == "HEAD" or fields[0] in excluded:
+    if fields.len < 3 or fields[0] == "HEAD" or fields[0] in excluded:
       continue
+    var required = false
+    for update in updates:
+      if update.remoteName == fields[0]:
+        required = true
+        break
+    try:
+      if not required and fields[2].parseBiggestInt() < cutoffEpoch:
+        continue
+    except ValueError:
+      stderr.writeLine("Error: Git returned an invalid activity date for " &
+        remote & "/" & fields[0] & ".")
+      result.ok = false
+      return
     let startingIndex = startingTips.findTip(fields[0])
     result.branches.add Branch(
       name: fields[0],
@@ -446,6 +473,8 @@ proc runStackCheck*(): int =
       echo "      --base=BRANCH            stack base (default: remote HEAD)"
       echo "      --release-branches=LIST  space-separated excluded branches"
       echo "                               default: " & DefaultReleases
+      echo "Active remote branches: last " & $ActiveBranchMonths &
+        " months; requested branches are always included."
       echo "  -h, --help                   show this help"
       return 0
     elif arg.startsWith("-"):
@@ -492,7 +521,8 @@ proc runStackCheck*(): int =
     return 1
   stderr.writeLine("Checking branch stack against " & remote & "/" &
     baseInfo.name & "...")
-  var branchInfo = enumerateBranches(remote, baseInfo.baseSha, releases, initial.tips)
+  var branchInfo = enumerateBranches(
+    remote, baseInfo.baseSha, releases, initial.tips, updates)
   if not branchInfo.ok:
     return fail("could not enumerate remote branches.")
 
@@ -564,6 +594,8 @@ proc runStackPush*(): int =
       echo "      --base=BRANCH            stack base (default: remote HEAD)"
       echo "      --release-branches=LIST  space-separated excluded branches"
       echo "                               default: " & DefaultReleases
+      echo "Active remote branches: last " & $ActiveBranchMonths &
+        " months; requested branches are always included."
       echo "  -h, --help                   show this help"
       return 0
     elif arg.startsWith("-"):
@@ -650,7 +682,8 @@ proc runStackPush*(): int =
     return 1
   stderr.writeLine("Checking branch stack against " & remote & "/" &
     baseInfo.name & "...")
-  var branchInfo = enumerateBranches(remote, baseInfo.baseSha, releases, initial.tips)
+  var branchInfo = enumerateBranches(
+    remote, baseInfo.baseSha, releases, initial.tips, updates)
   if not branchInfo.ok:
     return fail("could not enumerate remote branches.")
   applyUpdates(branchInfo.branches, updates, releases, baseInfo.baseSha, true)
