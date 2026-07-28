@@ -267,7 +267,8 @@ if [ ${#branches[@]} -eq 0 ] && ([ "$mode" == "add" ] || [ "$mode" == "remove" ]
       -e "s~^Merge remote-tracking branch '((refs/)?remotes/)?[^/]+/([^']+)'.*~\3~" \
       -e "s~^Merge remote-tracking branch '([^']+)'.*~\1~" \
       -e "s~^Merge branch '([^']+)'.*~\1~" \
-      -e "s~^Merge pull request #[0-9]+ from [^/]+/(.+)~\1~" | \
+      -e "s~^Merge pull request #[0-9]+ from [^/]+/(.+)~\1~" \
+      -e "s~^Merge ([^ ]+) into [^ ]+$~\1~" | \
     awk '!x[$0]++'
   ))
 fi

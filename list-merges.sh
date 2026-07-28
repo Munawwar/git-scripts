@@ -22,4 +22,5 @@ git log --format="%s" --merges --reverse "origin/master..origin/$1" \
       -e "s~^Merge remote-tracking branch '([^']+)'.*~\1~" \
       -e "s~^Merge branch '([^']+)'.*~\1~" \
       -e "s~^Merge pull request #[0-9]+ from [^/]+/(.+)~\1~" \
+      -e "s~^Merge ([^ ]+) into [^ ]+$~\1~" \
   | awk '!x[$0]++'
