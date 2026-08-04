@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # Lists remote branches whose tips are older than the configured age and are
-# already ancestors of the remote base branch. Deletion is opt-in and uses one
+# already ancestors of the remote base branch. Deletion is opt-in and uses
 # atomic batches of 50 plus exact leases, so a branch that moves after scanning
-# is not deleted.
+# is not deleted. A matching local branch is then deleted only if its tip still
+# equals the remote tip captured during scanning.
 #
 # Examples:
 #   prune-merged-branches.sh
@@ -117,6 +118,8 @@ fi
 printf 'Deleting %d branch(es) from %s in batches of %d...\n' \
   "${#branches[@]}" "$remote" "$batch_size"
 failures=()
+deleted_branches=()
+deleted_shas=()
 deleted=0
 for ((start = 0; start < ${#branches[@]}; start += batch_size)); do
   end=$((start + batch_size))
@@ -130,25 +133,49 @@ for ((start = 0; start < ${#branches[@]}; start += batch_size)); do
     deletions+=(":refs/heads/${branches[i]}")
   done
   printf '  Deleting batch %d-%d...\n' "$((start + 1))" "$end"
-  if git push --atomic --quiet "${leases[@]}" "$remote" "${deletions[@]}"; then
+  if git push --atomic --quiet --no-verify \
+      "${leases[@]}" "$remote" "${deletions[@]}"; then
     ((deleted += end - start))
+    for ((i = start; i < end; ++i)); do
+      deleted_branches+=("${branches[i]}")
+      deleted_shas+=("${shas[i]}")
+    done
     continue
   fi
 
   printf '  Warning: batch failed; retrying its branches individually.\n' >&2
   for ((i = start; i < end; ++i)); do
     branch=${branches[i]}
-    if git push --quiet \
+    if git push --quiet --no-verify \
         "--force-with-lease=refs/heads/$branch:${shas[i]}" \
         "$remote" ":refs/heads/$branch"; then
       ((++deleted))
+      deleted_branches+=("$branch")
+      deleted_shas+=("${shas[i]}")
     else
       printf '  Error: failed to delete %s; continuing.\n' "$branch" >&2
       failures+=("$branch")
     fi
   done
 done
+
+# Remove only local branches that still point to the remote tips just deleted.
+local_deleted=0
+for ((i = 0; i < ${#deleted_branches[@]}; ++i)); do
+  branch=${deleted_branches[i]}
+  local_sha=$(git rev-parse --verify "refs/heads/$branch" 2>/dev/null) || continue
+  if [[ $local_sha != "${deleted_shas[i]}" ]]; then
+    printf '  Keeping local %s: its tip differs from the deleted remote branch.\n' "$branch"
+  elif git branch -D -- "$branch" >/dev/null; then
+    printf '  Deleted matching local branch %s.\n' "$branch"
+    ((++local_deleted))
+  else
+    printf '  Warning: could not delete matching local branch %s.\n' "$branch" >&2
+  fi
+done
+
 if [[ ${#failures[@]} -gt 0 ]]; then
   fail "deleted $deleted branch(es), but failed to delete ${#failures[@]}: ${failures[*]}"
 fi
-printf 'Deleted %d merged branch(es) from %s.\n' "$deleted" "$remote"
+printf 'Deleted %d remote branch(es) from %s and %d matching local branch(es).\n' \
+  "$deleted" "$remote" "$local_deleted"
