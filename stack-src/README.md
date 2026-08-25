@@ -52,16 +52,22 @@ stack-push --base=main --release-branches="main staging" feature-a
 ```sh
 stack-push feature-a
 stack-push -y origin feature-a feature-b
+stack-push --dry-run feature-a
 stack-push --force feature-a
 ```
 
 `-y` or `--yes` performs all required repairs without prompting.
+
+`-n` or `--dry-run` prints the detected ancestor/descendant stack and required
+repairs, then exits without changing local branches or pushing. Combine it with
+`--no-fetch` to avoid updating remote-tracking refs.
 
 `stack-push` options:
 
 ```text
 -y, --yes                    restack without prompting
 -f, --force                  allow an intentional remote-history rewrite
+-n, --dry-run                show the detected stack without changing or pushing branches
     --no-fetch               use existing remote-tracking refs
     --remote=NAME            push remote (default: origin)
     --base=BRANCH            stack base (default: remote HEAD)
@@ -84,11 +90,12 @@ Unless `--no-fetch` is supplied, the tools fetch and prune every branch under
 `refs/heads/*`. Shallow clones are unshallowed, so ancestry checks use the
 complete reachable commit graph.
 
-Branches already merged into the configured base and branches in the release
-list are excluded. For every remaining branch, the nearest branch tip in its
-ancestry is treated as its parent. The proposed push commit IDs are then
-applied to that graph to find children and descendants that require
-restacking.
+Branches already merged into the configured base, branches in the release
+list, and branches inactive for more than two months are excluded. Explicitly
+requested branches are always included. For every remaining branch, the
+nearest branch tip in its ancestry is treated as its parent. The proposed push
+commit IDs are then applied to that graph to find children and descendants
+that require restacking.
 
 Without `--base`, the tools use the selected remote's symbolic HEAD, falling
 back to `main` and then `master` when that symbolic ref is unavailable.

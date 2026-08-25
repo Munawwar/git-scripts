@@ -103,10 +103,10 @@ install -m755 stack-check.com ~/.local/bin/stack-check
 install -m755 stack-push.com ~/.local/bin/stack-push
 cp stack-check.com /path/to/repository/.git/hooks/pre-push
 chmod +x /path/to/repository/.git/hooks/pre-push
-alias scheck='stack-check'
-alias spush='stack-push'
-stack-push feature-a
-stack-push -y origin feature-a feature-b
+
+alias gsp='stack-push.com'
+gsp feature-a
+gsp -y origin feature-a feature-b
 ```
 
 See [stack-src/README.md](stack-src/README.md) for configuration, safety

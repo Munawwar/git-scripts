@@ -271,8 +271,31 @@ commit_file a a1 A1
 run_push -y -f --no-fetch feature-a
 check_status 0
 check_output "feature-b must be restacked onto feature-a"
-check_output "feature-b → rebasing onto feature-a"
+check_output "Rebasing feature-b onto feature-a"
 check_ancestor feature-a feature-b "omitted child restack"
+
+start_case "dry run reports the stack without changing local or remote tips"
+new_repo
+"$REAL_GIT" -C "$WORK" checkout -qb feature-a
+commit_file a a0 A0
+push_branch feature-a
+remote_a=$("$REAL_GIT" -C "$WORK" rev-parse origin/feature-a)
+"$REAL_GIT" -C "$WORK" checkout -qb feature-b
+commit_file b b0 B0
+push_branch feature-b
+local_b=$("$REAL_GIT" -C "$WORK" rev-parse feature-b)
+"$REAL_GIT" -C "$WORK" checkout -q feature-a
+"$REAL_GIT" -C "$WORK" reset -q --hard master
+commit_file a a1 A1
+run_push --dry-run -f --no-fetch feature-a
+check_status 0
+check_output "feature-a depends on master (requested)"
+check_output "feature-b depends on feature-a"
+check_output "Dry run complete; no local branches were changed and nothing was pushed."
+check_equal "$("$REAL_GIT" -C "$WORK" rev-parse feature-b)" \
+  "$local_b" "dry run changed the omitted child"
+check_equal "$("$REAL_GIT" --git-dir="$REMOTE" rev-parse refs/heads/feature-a)" \
+  "$remote_a" "dry run changed the requested remote branch"
 
 start_case "old requested parent retains its recent descendant"
 new_repo
@@ -288,7 +311,7 @@ push_branch feature-b
 commit_file a a1 A1
 run_push -y -f --no-fetch feature-a
 check_status 0
-check_output "feature-b → rebasing onto feature-a"
+check_output "Rebasing feature-b onto feature-a"
 check_ancestor feature-a feature-b "recent child of old requested parent"
 
 start_case "already-restacked omitted child stays silent but is pushed"
@@ -310,7 +333,7 @@ local_b=$("$REAL_GIT" -C "$WORK" rev-parse HEAD)
 run_push_without_tty -f --no-fetch feature-a
 check_status 0
 check_output "No branches need restacking."
-check_no_output "feature-b"
+check_no_output "Rebasing feature-b"
 check_equal "$("$REAL_GIT" --git-dir="$REMOTE" rev-parse refs/heads/feature-b)" \
   "$local_b" "already-restacked child was not pushed"
 
@@ -331,7 +354,7 @@ new_a=$("$REAL_GIT" -C "$WORK" rev-parse HEAD)
 "$REAL_GIT" -C "$WORK" merge -q --no-ff -m "merge rewritten parent" "$new_a"
 run_push -y -f --no-fetch feature-a
 check_status 0
-check_output "feature-b → rebasing onto feature-a"
+check_output "Rebasing feature-b onto feature-a"
 check_ancestor feature-a feature-b "merged old and new parent histories"
 check_not_ancestor "$old_a" feature-b "obsolete parent history"
 
@@ -353,7 +376,7 @@ run_push -y -f --no-fetch feature-a
 check_status 0
 check_ancestor feature-a feature-b "first repaired edge"
 check_ancestor feature-b feature-c "propagated repaired edge"
-check_output "feature-c → rebasing onto feature-b"
+check_output "Rebasing feature-c onto feature-b"
 
 start_case "branching descendants C and D are repaired after B"
 new_repo
@@ -392,7 +415,7 @@ push_branch feature-b
 commit_file a a1 A1
 run_push -y -f --no-fetch feature-a
 check_status 0
-check_output "feature-b ← creating local branch from origin/feature-b"
+check_output "Creating local branch feature-b from origin/feature-b"
 check_ancestor feature-a feature-b "created omitted child"
 
 start_case "dirty worktree blocks a required restack"

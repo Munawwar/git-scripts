@@ -4,6 +4,12 @@ const
   ActiveBranchMonths = 2
   DefaultReleases = "dev test release master main"
   NoTtyError = "push would unstack branches; aborting because no interactive terminal is available."
+  Green = "\x1B[1;32m"
+  Yellow = "\x1B[1;33m"
+  Red = "\x1B[1;31m"
+  LightWhite = "\x1B[37m"
+  BoldWhite = "\x1B[1;97m"
+  Reset = "\x1B[0;m"
 
 type
   ## One active remote branch and its inferred historical stack relationship.
@@ -47,8 +53,11 @@ proc git(args: openArray[string]; parentStreams = false): CommandResult =
     result.output = error.msg
     result.status = 127
 
+proc paint(code, text: string): string =
+  if posix.isatty(stdout.getFileHandle().cint) != 0: code & text & Reset else: text
+
 proc fail(message: string): int =
-  stderr.writeLine("Error: " & message)
+  stderr.writeLine(paint(Red, "Error:") & " " & message)
   1
 
 proc findTip(tips: openArray[RemoteTip]; name: string): int =
@@ -383,10 +392,14 @@ proc prompt(message: string; choices: openArray[string]):
     return
   result.available = true
   defer: tty.close()
-  tty.write("\n" & message & "\n")
+  tty.write("\n" & paint(BoldWhite, message) & "\n")
   for choice in choices:
-    tty.write("  " & choice & "\n")
-  tty.write("Choice: ")
+    let code =
+      if choice.startsWith("[r]") or choice.startsWith("[y]"): Green
+      elif choice.startsWith("[a]") or choice.startsWith("[n]"): Red
+      else: Yellow
+    tty.write("  " & paint(code, choice) & "\n")
+  tty.write(paint(BoldWhite, "Choice:") & " ")
   tty.flushFile()
   try:
     result.answer = tty.readLine().strip().toLowerAscii()
@@ -408,7 +421,10 @@ proc warnLocalChanges(branches: openArray[string]; remoteState: string) =
 proc replayCommits(
   name, newBase, oldBase, restore: string
 ): ReplayResult =
-  if git(["rebase", "--onto", newBase, oldBase, name], parentStreams = true).status != 0:
+  let rebase = git(["rebase", "--quiet", "--onto", newBase, oldBase, name])
+  if rebase.status != 0:
+    if rebase.output.strip().len > 0:
+      stderr.writeLine(rebase.output.strip())
     let abortOk = git(["rebase", "--abort"]).status == 0
     let restoreOk = git(["checkout", "--quiet", restore], parentStreams = true).status == 0
     result.changed = not abortOk
@@ -442,6 +458,41 @@ proc acceptReplay(changedBranches: var seq[string]; name: string;
   if not replay.ok:
     warnLocalChanges(changedBranches, "The remote push has not started.")
   replay.ok
+
+proc printDetectedStack(branches: openArray[Branch]; base: string) =
+  stderr.writeLine(paint(BoldWhite, "Detected stack:"))
+  var maxDepth = -1
+  for branch in branches:
+    if branch.depth > maxDepth: maxDepth = branch.depth
+  var printed = false
+  if maxDepth >= 0:
+    for depth in 0 .. maxDepth:
+      for i in 0 ..< branches.len:
+        if branches[i].depth != depth: continue
+        var related = false
+        for pushedIndex in 0 ..< branches.len:
+          if not branches[pushedIndex].pushed: continue
+          var ancestor = pushedIndex
+          while ancestor >= 0 and ancestor != i:
+            ancestor = branches[ancestor].parent
+          var descendant = i
+          while descendant >= 0 and descendant != pushedIndex:
+            descendant = branches[descendant].parent
+          if ancestor == i or descendant == pushedIndex:
+            related = true
+            break
+        if not related: continue
+        let parentName =
+          if branches[i].parent >= 0: branches[branches[i].parent].name
+          else: base
+        let requested = if branches[i].pushed: paint(Green, " (requested)") else: ""
+        stderr.writeLine("  " & paint(BoldWhite, branches[i].name) & " " &
+          paint(LightWhite, "depends on") & " " & paint(BoldWhite, parentName) &
+          requested)
+        printed = true
+  if not printed:
+    stderr.writeLine("  No active stack branches found.")
+  stderr.writeLine("")
 
 proc runStackCheck*(): int =
   if existsEnv("STACK_CHECK_SKIP"):
@@ -519,7 +570,7 @@ proc runStackCheck*(): int =
   let baseInfo = resolveBase(remote, base, initial.tips)
   if not baseInfo.ok:
     return 1
-  stderr.writeLine("Checking branch stack against " & remote & "/" &
+  stderr.writeLine(paint(Yellow, "Checking branch stack against ") & remote & "/" &
     baseInfo.name & "...")
   var branchInfo = enumerateBranches(
     remote, baseInfo.baseSha, releases, initial.tips, updates)
@@ -544,10 +595,11 @@ proc runStackCheck*(): int =
       let pushNote =
         if branch.pushed: " (included in this push)"
         else: " (OMITTED from this push)"
-      stderr.writeLine("• " & branch.name & " must be restacked onto " &
-        parentName & pushNote)
+      stderr.writeLine(paint(Yellow, "• ") & paint(BoldWhite, branch.name) &
+        paint(Yellow, " must be restacked onto ") & paint(BoldWhite, parentName) &
+        paint(Yellow, pushNote))
   if staleCount == 0:
-    stderr.writeLine("No branches need restacking.")
+    stderr.writeLine(paint(Green, "No branches need restacking."))
     return 0
 
   let response = prompt(
@@ -566,7 +618,7 @@ proc runStackPush*(): int =
   # Parse configuration and collect the requested local branches.
   var
     remote = "origin"
-    remoteExplicit, autoYes, allowRewrite = false
+    remoteExplicit, autoYes, allowRewrite, dryRun = false
     doFetch = true
     base = ""
     releases = DefaultReleases
@@ -576,6 +628,8 @@ proc runStackPush*(): int =
       autoYes = true
     elif arg in ["-f", "--force"]:
       allowRewrite = true
+    elif arg in ["-n", "--dry-run"]:
+      dryRun = true
     elif arg == "--no-fetch":
       doFetch = false
     elif arg.startsWith("--remote="):
@@ -589,6 +643,7 @@ proc runStackPush*(): int =
       echo "Usage: stack-push [options] [remote] [branch ...]"
       echo "  -y, --yes                    restack without prompting"
       echo "  -f, --force                  allow removal of commits present when the command started"
+      echo "  -n, --dry-run                show the detected stack without changing or pushing branches"
       echo "      --no-fetch               use existing remote-tracking refs"
       echo "      --remote=NAME            push remote (default: origin)"
       echo "      --base=BRANCH            stack base (default: remote HEAD)"
@@ -680,7 +735,7 @@ proc runStackPush*(): int =
   let baseInfo = resolveBase(remote, base, initial.tips)
   if not baseInfo.ok:
     return 1
-  stderr.writeLine("Checking branch stack against " & remote & "/" &
+  stderr.writeLine(paint(Yellow, "Checking branch stack against ") & remote & "/" &
     baseInfo.name & "...")
   var branchInfo = enumerateBranches(
     remote, baseInfo.baseSha, releases, initial.tips, updates)
@@ -690,6 +745,7 @@ proc runStackPush*(): int =
   if not inferParents(branchInfo.branches, baseInfo.historyBaseSha):
     return 1
   let maxDepth = markStaleBranches(branchInfo.branches)
+  printDetectedStack(branchInfo.branches, baseInfo.name)
 
   # Protect omitted stale descendants before adding them to the operation. A
   # local branch may contain unpublished work, but cannot replace fetched work.
@@ -777,12 +833,17 @@ proc runStackPush*(): int =
       let pushNote =
         if branch.pushed: " (included in this push)"
         else: " (OMITTED from this push)"
-      stderr.writeLine("• " & branch.name & " must be restacked onto " &
-        parentName & pushNote)
+      stderr.writeLine(paint(Yellow, "• ") & paint(BoldWhite, branch.name) &
+        paint(Yellow, " must be restacked onto ") & paint(BoldWhite, parentName) &
+        paint(Yellow, pushNote))
 
   let localWorkCount = restackCount + syncCount
+  if dryRun:
+    stderr.writeLine(paint(Green,
+      "Dry run complete; no local branches were changed and nothing was pushed."))
+    return 0
   if localWorkCount == 0:
-    stderr.writeLine("No branches need restacking.")
+    stderr.writeLine(paint(Green, "No branches need restacking."))
   var doRestack = staleCount > 0 or syncCount > 0
   var answer = if autoYes: "r" else: ""
   if localWorkCount > 0 and not autoYes:
@@ -819,10 +880,11 @@ proc runStackPush*(): int =
     let restoreTarget = restore.output.strip()
 
     # Print compact recovery references once, before changing any local tip.
-    stderr.writeLine("\nLocal branch tips before restacking:")
+    stderr.writeLine("\n" & paint(BoldWhite, "Local branch tips before restacking:"))
     for update in updates:
       if update.needsSync:
-        stderr.writeLine("  " & update.remoteName & " [" & update.localSha[0 ..< 7] & "]")
+        stderr.writeLine("  " & paint(BoldWhite, update.remoteName) & " " &
+          paint(LightWhite, "[" & update.localSha[0 ..< 7] & "]"))
     for branch in branchInfo.branches:
       if not branch.stale or not branch.needsRestack:
         continue
@@ -831,8 +893,12 @@ proc runStackPush*(): int =
         if update.needsSync and update.remoteName == branch.name:
           alreadyPrinted = true
       if not alreadyPrinted:
-        let tip = if branch.localSha.len > 0: branch.localSha[0 ..< 7] else: "missing"
-        stderr.writeLine("  " & branch.name & " [" & tip & "]")
+        let tip =
+          if branch.localSha.len > 0:
+            paint(LightWhite, "[" & branch.localSha[0 ..< 7] & "]")
+          else:
+            paint(Red, "[missing]")
+        stderr.writeLine("  " & paint(BoldWhite, branch.name) & " " & tip)
     stderr.writeLine("")
 
     # First integrate remote commits that appeared during the fetch. The
@@ -840,8 +906,8 @@ proc runStackPush*(): int =
     for i in 0 ..< updates.len:
       if not updates[i].needsSync:
         continue
-      stderr.writeLine(updates[i].remoteName & " → replaying local commits onto updated " &
-        remote & "/" & updates[i].remoteName)
+      stderr.writeLine(paint(Yellow, "Replaying ") & paint(BoldWhite, updates[i].remoteName) &
+        paint(Yellow, " onto updated " & remote & "/" & updates[i].remoteName))
       let replay = replayCommits(
         updates[i].remoteName, updates[i].fetchedRemoteSha,
         updates[i].syncBaseSha, restoreTarget
@@ -857,9 +923,9 @@ proc runStackPush*(): int =
     for i in 0 ..< branchInfo.branches.len:
       if not branchInfo.branches[i].needsSync or branchInfo.branches[i].pushed:
         continue
-      stderr.writeLine(branchInfo.branches[i].name &
-        " → replaying local commits onto updated " & remote & "/" &
-        branchInfo.branches[i].name)
+      stderr.writeLine(paint(Yellow, "Replaying ") &
+        paint(BoldWhite, branchInfo.branches[i].name) & paint(Yellow,
+        " onto updated " & remote & "/" & branchInfo.branches[i].name))
       let replay = replayCommits(
         branchInfo.branches[i].name, branchInfo.branches[i].remoteSha,
         branchInfo.branches[i].historySha, restoreTarget
@@ -878,8 +944,9 @@ proc runStackPush*(): int =
           continue
         let parent = branchInfo.branches[i].parent
         if branchInfo.branches[i].localSha.len == 0:
-          stderr.writeLine(branchInfo.branches[i].name & " ← creating local branch from " &
-            remote & "/" & branchInfo.branches[i].name)
+          stderr.writeLine(paint(Yellow, "Creating local branch ") &
+            paint(BoldWhite, branchInfo.branches[i].name) & paint(Yellow,
+            " from " & remote & "/" & branchInfo.branches[i].name))
           if git(["branch", branchInfo.branches[i].name,
               branchInfo.branches[i].remoteSha], parentStreams = true).status != 0:
             warnLocalChanges(changedBranches, "The remote push has not started.")
@@ -924,7 +991,9 @@ proc runStackPush*(): int =
           branchInfo.branches[i].futureSha = branchInfo.branches[i].localSha
           continue
 
-        stderr.writeLine(branchInfo.branches[i].name & " → rebasing onto " & parentName)
+        stderr.writeLine(paint(Yellow, "Rebasing ") &
+          paint(BoldWhite, branchInfo.branches[i].name) & paint(Yellow, " onto ") &
+          paint(BoldWhite, parentName))
         let oldParent =
           if parent >= 0: branchInfo.branches[parent].historySha
           else: baseInfo.historyBaseSha
@@ -944,7 +1013,7 @@ proc runStackPush*(): int =
   # Never trust the plan alone. Verify the realized parent edge for every
   # surviving stack branch after all commit IDs are final and before any push.
   if doRestack:
-    stderr.writeLine("Validating final branch stack...")
+    stderr.writeLine(paint(Yellow, "Validating final branch stack..."))
     for i in 0 ..< branchInfo.branches.len:
       let parent = branchInfo.branches[i].parent
       if branchInfo.branches[i].deleted or parent < 0:
@@ -986,7 +1055,7 @@ proc runStackPush*(): int =
     pushArgs.add update.remoteName & ":refs/heads/" & update.remoteName
 
   # Skip only stack-check in the child push; all unrelated hooks still run.
-  stderr.writeLine("Pushing " & $pushCount & " branch(es) to " & remote & "...")
+  stderr.writeLine(paint(Yellow, "Pushing " & $pushCount & " branch(es) to " & remote & "..."))
   let hadSkip = existsEnv("STACK_CHECK_SKIP")
   let oldSkip = getEnv("STACK_CHECK_SKIP")
   putEnv("STACK_CHECK_SKIP", "1")
@@ -998,11 +1067,11 @@ proc runStackPush*(): int =
     return fail("the atomic stack push failed; the remote outcome is unknown. " &
       "Fetch " & remote & " before retrying.")
   if not doRestack and staleCount > 0:
-    stderr.writeLine("Pushed requested branches without restacking.")
+    stderr.writeLine(paint(Yellow, "Pushed requested branches without restacking."))
   elif doRestack and localWorkCount > 0:
-    stderr.writeLine("Restacked and pushed all affected branches.")
+    stderr.writeLine(paint(Green, "Restacked and pushed all affected branches."))
   else:
-    stderr.writeLine("Push completed.")
+    stderr.writeLine(paint(Green, "Push completed."))
   0
 
 proc runCommand*(command: proc(): int) =
